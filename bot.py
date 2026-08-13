@@ -310,24 +310,44 @@ def safe_filename(name: str) -> str:
     return (name or "audio")[:80]
 
 
-def subscribe_keyboard(channels: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+def channel_public_url(ch: dict[str, Any]) -> str:
+    url = (ch.get("url") or "").strip()
+    if url.startswith(("http://", "https://")):
+        return url
+    username = (ch.get("username") or "").strip().lstrip("@")
+    if username:
+        return f"https://t.me/{username}"
+    chat_id = ch.get("chat_id")
+    if chat_id is not None:
+        raw = str(chat_id)
+        if raw.startswith("-100") and raw[4:].isdigit():
+            return f"https://t.me/c/{raw[4:]}/1"
+    return ""
+
+
+def subscribe_rows(channels: list[dict[str, Any]]) -> list[list[InlineKeyboardButton]]:
     rows: list[list[InlineKeyboardButton]] = []
     for i, ch in enumerate(channels, start=1):
-        url = (ch.get("url") or "").strip()
-        username = (ch.get("username") or "").strip().lstrip("@")
-        if not url and username:
-            url = f"https://t.me/{username}"
-        if not url:
-            continue
-        rows.append(
-            [InlineKeyboardButton(f"📢 Подписаться · {channel_button_title(ch, i)}", url=url)]
-        )
-    rows.append([InlineKeyboardButton("✅ Я подписался", callback_data="check_sub")])
-    return InlineKeyboardMarkup(rows)
+        title = channel_button_title(ch, i)
+        url = channel_public_url(ch)
+        if url:
+            rows.append([InlineKeyboardButton(f"📢 Подписаться · {title}", url=url)])
+        else:
+            rows.append(
+                [InlineKeyboardButton(f"📢 {title}", callback_data=f"subneed:{ch.get('id')}")]
+            )
+    if channels:
+        rows.append([InlineKeyboardButton("✅ Я подписался", callback_data="check_sub")])
+    return rows
 
 
-def user_home_keyboard(admin: bool) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("🎵 Как скачать?", callback_data="help")]]
+def subscribe_keyboard(channels: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(subscribe_rows(channels))
+
+
+def user_home_keyboard(admin: bool, channels: list[dict[str, Any]] | None = None) -> InlineKeyboardMarkup:
+    rows = subscribe_rows(channels or [])
+    rows.append([InlineKeyboardButton("🎵 Как скачать?", callback_data="help")])
     if admin:
         rows.append([InlineKeyboardButton("🛠 Админка", callback_data="admin")])
     return InlineKeyboardMarkup(rows)
@@ -343,6 +363,7 @@ def admin_keyboard(channels: list[dict[str, Any]]) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🗑", callback_data=f"chdel:{ch.get('id')}"),
             ]
         )
+    rows.append([InlineKeyboardButton("👁 Как видят кнопку подписки", callback_data="subpreview")])
     rows.append([InlineKeyboardButton("➕ Добавить канал", callback_data="chadd")])
     rows.append([InlineKeyboardButton("♻️ Рестарт бота", callback_data="restart_ask")])
     rows.append([InlineKeyboardButton("🔄 Обновить", callback_data="admin")])
@@ -512,23 +533,23 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not user or not update.message:
         return
     pending_action.pop(user.id, None)
+    channels = load_settings().get("channels") or []
+    text = welcome_text(is_admin(user))
+    if channels:
+        text += "\n\n📢 Сначала подпишись на канал кнопкой ниже, потом кидай ссылку на YouTube."
     await update.message.reply_html(
-        welcome_text(is_admin(user)),
-        reply_markup=user_home_keyboard(is_admin(user)),
+        text,
+        reply_markup=user_home_keyboard(is_admin(user), channels),
         disable_web_page_preview=True,
     )
-    channels = load_settings().get("channels") or []
-    if channels and not is_admin(user):
-        missing, broken = await required_missing(context.bot, user.id, channels)
-        if missing or broken:
-            await reply_subscribe_gate(update, channels, missing, broken)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
+        channels = load_settings().get("channels") or []
         await update.message.reply_html(
             welcome_text(is_admin(update.effective_user)),
-            reply_markup=user_home_keyboard(is_admin(update.effective_user)),
+            reply_markup=user_home_keyboard(is_admin(update.effective_user), channels),
         )
 
 
@@ -601,10 +622,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.edit_message_text(
                 welcome_text(is_admin(user)),
                 parse_mode=ParseMode.HTML,
-                reply_markup=user_home_keyboard(is_admin(user)),
+                reply_markup=user_home_keyboard(is_admin(user), load_settings().get("channels") or []),
             )
         except BadRequest:
             pass
+        return
+
+    if data.startswith("subneed:"):
+        await query.answer(
+            "У этого канала нет публичной ссылки. Админ должен добавить https://t.me/канал или инвайт.",
+            show_alert=True,
+        )
         return
 
     if data == "check_sub":
@@ -612,7 +640,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not channels:
             await query.edit_message_text(
                 "✅ Ограничений нет. Пришли ссылку на YouTube.",
-                reply_markup=user_home_keyboard(is_admin(user)),
+                reply_markup=user_home_keyboard(is_admin(user), channels),
             )
             return
         missing, broken = await required_missing(context.bot, user.id, channels)
@@ -629,7 +657,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         await query.edit_message_text(
             "✅ Подписка есть. Кидай ссылку на YouTube — пришлю MP3.",
-            reply_markup=user_home_keyboard(is_admin(user)),
+            reply_markup=user_home_keyboard(is_admin(user), channels),
         )
         return
 
@@ -640,6 +668,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == "admin":
         pending_action.pop(user.id, None)
         await show_admin(query, context)
+        return
+
+    if data == "subpreview":
+        channels = load_settings().get("channels") or []
+        if not channels:
+            await query.answer("Сначала добавь канал.", show_alert=True)
+            return
+        await query.edit_message_text(
+            "Так кнопку «Подписаться» видят пользователи. Нажми — откроется канал.",
+            reply_markup=InlineKeyboardMarkup(
+                subscribe_rows(channels)
+                + [[InlineKeyboardButton("⬅️ Назад в админку", callback_data="admin")]]
+            ),
+            disable_web_page_preview=True,
+        )
         return
 
     if data == "chadd":
@@ -815,7 +858,9 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     pending_action.pop(user.id, None)
     title = channel_button_title(parsed, len(settings["channels"]))
     await update.message.reply_html(
-        f"✅ Добавил <b>{title}</b>. Пользователи должны на него подписаться.{warn}",
+        f"✅ Добавил <b>{title}</b>. Пользователи должны на него подписаться.{warn}\n\n"
+        "Так выглядит кнопка у пользователей:",
+        reply_markup=subscribe_keyboard(settings["channels"]),
         disable_web_page_preview=True,
     )
     await update.message.reply_html(admin_text(), reply_markup=admin_keyboard(settings["channels"]))
@@ -1495,7 +1540,12 @@ def main() -> None:
         log.info("stop signal")
 
     signal.signal(signal.SIGTERM, _stop)
-    log.info("Бот запущен. Админы: %s", ", ".join(sorted(ADMIN_USERNAMES)) or "—")
+    chans = load_settings().get("channels") or []
+    log.info(
+        "Бот запущен. Админы: %s. Каналы: %s",
+        ", ".join(sorted(ADMIN_USERNAMES)) or "—",
+        ", ".join(channel_public_url(c) or str(c.get("id")) for c in chans) or "нет",
+    )
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
