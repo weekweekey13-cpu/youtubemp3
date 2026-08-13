@@ -512,6 +512,8 @@ def admin_text() -> str:
         "",
         "Чтобы добавить: нажми «Добавить канал» и пришли ссылку вида",
         "<code>https://t.me/channel</code> или <code>@channel</code>.",
+        "",
+        "Пароль Google боту не нужен. По желанию пришли файл <code>cookies.txt</code> — для сложных роликов.",
     ]
     if channels:
         lines.append("")
@@ -861,6 +863,61 @@ def pick_best_audio(medias: list[dict[str, Any]]) -> dict[str, Any] | None:
     return max(audios, key=score)
 
 
+def download_via_loader(url: str, workdir: Path) -> dict[str, Any] | None:
+    from urllib.parse import quote
+
+    start_url = "https://loader.to/ajax/download.php?format=mp3&url=" + quote(url, safe="")
+    try:
+        start = http_json("GET", start_url, timeout=25)
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
+        log.warning("loader.to старт: %s", e)
+        return None
+    text = str(start.get("text") or start.get("message") or "")
+    if not start.get("success"):
+        low = text.lower()
+        if any(s in low for s in ("unavailable", "removed", "private", "not available")):
+            raise RuntimeError("UNAVAILABLE")
+        log.warning("loader.to отказ: %s", start)
+        return None
+    progress_url = start.get("progress_url")
+    if not progress_url:
+        return None
+    data = start
+    for _ in range(25):
+        if data.get("success") in (1, True) and data.get("download_url"):
+            break
+        time.sleep(2)
+        try:
+            data = http_json("GET", progress_url, timeout=20)
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
+            log.warning("loader.to progress: %s", e)
+            continue
+        msg = str(data.get("text") or data.get("message") or "")
+        if any(s in msg.lower() for s in ("unavailable", "removed", "private")):
+            raise RuntimeError("UNAVAILABLE")
+    download_url = data.get("download_url")
+    if not download_url:
+        log.warning("loader.to: нет download_url %s", data)
+        return None
+    mp3_path = workdir / "audio.mp3"
+    http_download(download_url, mp3_path)
+    info = data.get("info") if isinstance(data.get("info"), dict) else {}
+    title = (data.get("title") or info.get("title") or start.get("title") or "YouTube audio").strip()
+    duration = int(data.get("video_duration") or info.get("duration") or 0)
+    if duration and duration > MAX_DURATION_SEC:
+        mp3_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Видео длиннее {MAX_DURATION_SEC // 60} минут.")
+    return {
+        "path": mp3_path,
+        "thumb": None,
+        "title": title,
+        "artist": "YouTube",
+        "duration": duration,
+        "webpage_url": url,
+        "id": youtube_id(url) or "",
+    }
+
+
 def download_via_clipto(url: str, workdir: Path) -> dict[str, Any] | None:
     try:
         data = http_json(
@@ -983,27 +1040,25 @@ def download_via_ytdlp(url: str, workdir: Path) -> dict[str, Any] | None:
 
 def download_mp3(url: str, workdir: Path) -> dict[str, Any]:
     last_err = ""
-    try:
-        got = download_via_clipto(url, workdir)
-        if got:
-            log.info("Скачал через запасной сервер: %s", got.get("title"))
-            return got
-    except RuntimeError as e:
-        if str(e) == "UNAVAILABLE":
-            raise RuntimeError("Это видео недоступно (удалено, приватное или заблокировано).") from e
-        last_err = str(e)
-        log.warning("Clipto runtime: %s", e)
-    except Exception as e:
-        last_err = str(e)
-        log.warning("Clipto unexpected: %s", e)
-
-    try:
-        got = download_via_ytdlp(url, workdir)
-        if got:
-            return got
-    except RuntimeError as e:
-        last_err = str(e)
-
+    backends = (
+        ("loader.to", download_via_loader),
+        ("clipto", download_via_clipto),
+        ("yt-dlp", download_via_ytdlp),
+    )
+    for name, fn in backends:
+        try:
+            got = fn(url, workdir)
+            if got:
+                log.info("Скачал через %s: %s", name, got.get("title"))
+                return got
+        except RuntimeError as e:
+            if str(e) == "UNAVAILABLE":
+                raise RuntimeError("Это видео недоступно (удалено, приватное или заблокировано).") from e
+            last_err = str(e)
+            log.warning("%s: %s", name, e)
+        except Exception as e:
+            last_err = str(e)
+            log.warning("%s unexpected: %s", name, e)
     raise RuntimeError(humanize_ytdlp_error(last_err) if last_err else "Не получилось скачать. Попробуй другую ссылку.")
 
 
@@ -1121,6 +1176,29 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             shutil.rmtree(workdir, ignore_errors=True)
 
 
+async def handle_cookies_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not msg.document or not is_admin(user):
+        return
+    name = (msg.document.file_name or "").lower()
+    if "cookie" not in name and name != "cookies.txt":
+        await msg.reply_text("Нужен файл cookies.txt (Netscape). Пароль Google не присылай.")
+        return
+    if msg.document.file_size and msg.document.file_size > 2_000_000:
+        await msg.reply_text("Файл слишком большой.")
+        return
+    tg_file = await msg.document.get_file()
+    dest = DATA_DIR / "cookies.txt"
+    await tg_file.download_to_drive(custom_path=str(dest))
+    raw = dest.read_text(encoding="utf-8", errors="replace")
+    if "# Netscape" not in raw and "youtube.com" not in raw:
+        dest.unlink(missing_ok=True)
+        await msg.reply_text("Это не cookies YouTube. Экспортируй cookies.txt расширением Get cookies.txt LOCALLY.")
+        return
+    await msg.reply_text("Сохранил cookies. Сложные ролики теперь можно пробовать ещё раз.")
+
+
 async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     user = update.effective_user
@@ -1218,6 +1296,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_cookies_file))
     app.add_handler(MessageHandler(filters.FORWARDED, handle_forward))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(MessageHandler(filters.Entity("url") | filters.CaptionEntity("url"), handle_link))
