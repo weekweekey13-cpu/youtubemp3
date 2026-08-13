@@ -58,7 +58,7 @@ STATS_PATH = DATA_DIR / "stats.json"
 
 MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "1200"))  # 20 мин
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "45"))
-AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "192")
+AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "128")
 
 VIDEO_ID_RE = re.compile(
     r"(?:youtu\.be/|youtube(?:-nocookie)?\.com/(?:embed/|v/|shorts/|live/|clip/)|"
@@ -803,13 +803,13 @@ def http_json(method: str, url: str, payload: dict | None = None, headers: dict 
     return parsed if isinstance(parsed, dict) else {}
 
 
-def http_download(url: str, dest: Path, timeout: int = 90) -> None:
+def http_download(url: str, dest: Path, timeout: int = 60) -> None:
     req = Request(url, headers={"User-Agent": HTTP_UA, "Accept": "*/*"})
     limit = MAX_FILE_MB * 1024 * 1024
     with urlopen(req, timeout=timeout) as resp, dest.open("wb") as out:
         n = 0
         while True:
-            chunk = resp.read(64 * 1024)
+            chunk = resp.read(256 * 1024)
             if not chunk:
                 break
             n += len(chunk)
@@ -868,7 +868,7 @@ def download_via_loader(url: str, workdir: Path) -> dict[str, Any] | None:
 
     start_url = "https://loader.to/ajax/download.php?format=mp3&url=" + quote(url, safe="")
     try:
-        start = http_json("GET", start_url, timeout=25)
+        start = http_json("GET", start_url, timeout=12)
     except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
         log.warning("loader.to старт: %s", e)
         return None
@@ -883,12 +883,13 @@ def download_via_loader(url: str, workdir: Path) -> dict[str, Any] | None:
     if not progress_url:
         return None
     data = start
-    for _ in range(25):
+    deadline = time.time() + 28
+    while time.time() < deadline:
         if data.get("success") in (1, True) and data.get("download_url"):
             break
-        time.sleep(2)
+        time.sleep(0.45)
         try:
-            data = http_json("GET", progress_url, timeout=20)
+            data = http_json("GET", progress_url, timeout=8)
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
             log.warning("loader.to progress: %s", e)
             continue
@@ -990,7 +991,7 @@ def download_via_ytdlp(url: str, workdir: Path) -> dict[str, Any] | None:
     outtmpl = str(workdir / "ytdlp.%(ext)s")
     cookie = cookies_file()
     opts: dict[str, Any] = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "format": "bestaudio[abr<=160]/bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": {"default": outtmpl},
         "noplaylist": True,
         "quiet": True,
@@ -998,21 +999,13 @@ def download_via_ytdlp(url: str, workdir: Path) -> dict[str, Any] | None:
         "noprogress": True,
         "overwrites": True,
         "cachedir": False,
-        "retries": 2,
-        "fragment_retries": 3,
-        "extractor_retries": 2,
-        "socket_timeout": 20,
+        "retries": 1,
+        "fragment_retries": 2,
+        "extractor_retries": 1,
+        "socket_timeout": 12,
         "geo_bypass": True,
         "match_filter": match_filter,
-        "extractor_args": {"youtube": {"player_client": ["tv_embedded", "android", "ios"]}},
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": AUDIO_QUALITY,
-            }
-        ],
-        "postprocessor_args": {"ffmpeg": ["-threads", "1"]},
+        "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
     }
     if cookie:
         opts["cookiefile"] = cookie
@@ -1024,11 +1017,11 @@ def download_via_ytdlp(url: str, workdir: Path) -> dict[str, Any] | None:
     except (DownloadError, YoutubeDLError) as e:
         log.warning("yt-dlp: %s", e)
         raise RuntimeError(str(e)) from e
-    mp3 = find_file(workdir, {".mp3"})
-    if not mp3:
+    audio = find_file(workdir, {".m4a", ".mp3", ".webm", ".opus", ".ogg"})
+    if not audio:
         return None
     return {
-        "path": mp3,
+        "path": audio,
         "thumb": find_file(workdir, {".jpg", ".jpeg", ".png", ".webp"}),
         "title": (info.get("title") or "YouTube audio").strip(),
         "artist": (info.get("uploader") or info.get("channel") or "YouTube").strip(),
@@ -1040,14 +1033,18 @@ def download_via_ytdlp(url: str, workdir: Path) -> dict[str, Any] | None:
 
 def download_mp3(url: str, workdir: Path) -> dict[str, Any]:
     last_err = ""
-    backends = (
-        ("loader.to", download_via_loader),
-        ("clipto", download_via_clipto),
-        ("yt-dlp", download_via_ytdlp),
-    )
-    for name, fn in backends:
+    backends = [("loader.to", download_via_loader)]
+    if cookies_file():
+        backends.append(("yt-dlp", download_via_ytdlp))
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if len(backends) == 1:
+        name, fn = backends[0]
+        dest = workdir / name.replace(".", "_")
+        dest.mkdir(parents=True, exist_ok=True)
         try:
-            got = fn(url, workdir)
+            got = fn(url, dest)
             if got:
                 log.info("Скачал через %s: %s", name, got.get("title"))
                 return got
@@ -1055,10 +1052,34 @@ def download_mp3(url: str, workdir: Path) -> dict[str, Any]:
             if str(e) == "UNAVAILABLE":
                 raise RuntimeError("Это видео недоступно (удалено, приватное или заблокировано).") from e
             last_err = str(e)
-            log.warning("%s: %s", name, e)
-        except Exception as e:
-            last_err = str(e)
-            log.warning("%s unexpected: %s", name, e)
+        raise RuntimeError(humanize_ytdlp_error(last_err) if last_err else "Не получилось скачать. Попробуй другую ссылку.")
+
+    last_err = ""
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futs = {}
+        for name, fn in backends:
+            dest = workdir / name.replace(".", "_")
+            dest.mkdir(parents=True, exist_ok=True)
+            futs[pool.submit(fn, url, dest)] = name
+        try:
+            completed = as_completed(futs, timeout=55)
+        except TimeoutError:
+            completed = []
+        for fut in completed:
+            name = futs[fut]
+            try:
+                got = fut.result()
+                if got:
+                    log.info("Скачал через %s: %s", name, got.get("title"))
+                    return got
+            except RuntimeError as e:
+                if str(e) == "UNAVAILABLE":
+                    raise RuntimeError("Это видео недоступно (удалено, приватное или заблокировано).") from e
+                last_err = str(e)
+                log.warning("%s: %s", name, e)
+            except Exception as e:
+                last_err = str(e)
+                log.warning("%s unexpected: %s", name, e)
     raise RuntimeError(humanize_ytdlp_error(last_err) if last_err else "Не получилось скачать. Попробуй другую ссылку.")
 
 
@@ -1115,24 +1136,27 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     async with lock:
-        status = await msg.reply_text("⬇️ Скачиваю аудио и делаю MP3… это быстро.")
+        status = await msg.reply_text("⬇️ Качаю…")
         workdir = Path(tempfile.mkdtemp(prefix="ytmp3_", dir=str(DATA_DIR)))
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(download_mp3, url, workdir),
-                timeout=240,
+                timeout=70,
             )
             try:
-                await status.edit_text("📤 Отправляю MP3…")
+                await status.edit_text("📤 Отправляю…")
             except BadRequest:
                 pass
 
+            ext = result["path"].suffix.lower().lstrip(".") or "mp3"
+            if ext == "opus":
+                ext = "ogg"
             thumb_file = None
             audio_file = open(result["path"], "rb")
             try:
                 kwargs: dict[str, Any] = {
                     "audio": audio_file,
-                    "filename": f"{safe_filename(result['title'])}.mp3",
+                    "filename": f"{safe_filename(result['title'])}.{ext}",
                     "title": result["title"][:64],
                     "performer": result["artist"][:64],
                     "caption": f"🎵 {result['title']}\n⏱ {fmt_duration(result['duration'])}",
