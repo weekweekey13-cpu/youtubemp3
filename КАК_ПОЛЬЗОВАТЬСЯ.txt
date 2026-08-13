@@ -1,6 +1,6 @@
 Бот: https://t.me/dowloadmp3youtube_mp3bot
 
-Админ: @bonamartin69
+Админы: @bonamartin69, @itsenlay
 Команда: /admin
 
 1) Добавь бота АДМИНОМ в канал (обязательно, иначе пишет что ты не подписан).

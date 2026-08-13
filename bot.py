@@ -3,7 +3,7 @@ YouTube → MP3 Telegram-бот.
 
 Пользователь кидает ссылку на YouTube — получает MP3.
 Перед скачиванием обязательна подписка на каналы из админки.
-Админ @bonamartin69: каналы, рестарт.
+Админы @bonamartin69, @itsenlay: каналы, рестарт.
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 ADMIN_USERNAMES = {
     u.strip().lstrip("@").lower()
-    for u in os.getenv("ADMIN_USERNAMES", "bonamartin69").split(",")
+    for u in os.getenv("ADMIN_USERNAMES", "bonamartin69,itsenlay").split(",")
     if u.strip()
 }
 
