@@ -58,14 +58,17 @@ MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "1200"))  # 20 мин
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "45"))
 AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "192")
 
-YOUTUBE_RE = re.compile(
-    r"(?P<url>https?://(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/[^\s<>]+)",
+VIDEO_ID_RE = re.compile(
+    r"(?:youtu\.be/|youtube(?:-nocookie)?\.com/(?:embed/|v/|shorts/|live/|clip/)|"
+    r"(?:music\.)?youtube(?:-nocookie)?\.com/watch\S*?[?&]v=)"
+    r"([A-Za-z0-9_-]{11})",
     re.IGNORECASE,
 )
-YOUTUBE_SHORT_RE = re.compile(
-    r"(?:https?://)?(?:www\.|m\.)?(?:youtube\.com/(?:watch\?v=|shorts/|embed/|live/)|youtu\.be/)[\w\-]{6,}",
+ANY_YT_RE = re.compile(
+    r"(?P<url>(?:https?://)?(?:www\.|m\.)?(?:music\.)?(?:youtube\.com|youtu\.be|youtube-nocookie\.com)/[^\s<>]+)",
     re.IGNORECASE,
 )
+BARE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 TG_LINK_RE = re.compile(
     r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_+]+)",
     re.IGNORECASE,
@@ -168,15 +171,18 @@ def get_lock(user_id: int) -> asyncio.Lock:
 def extract_youtube_url(text: str) -> str | None:
     if not text:
         return None
-    text = text.strip()
-    m = YOUTUBE_RE.search(text)
-    if m:
-        return m.group("url").rstrip(").,]")
-    if YOUTUBE_SHORT_RE.search(text):
-        raw = text.split()[0].rstrip(").,]")
+    text = text.strip().strip("<>")
+    vid = VIDEO_ID_RE.search(text)
+    if vid:
+        return f"https://www.youtube.com/watch?v={vid.group(1)}"
+    any_yt = ANY_YT_RE.search(text)
+    if any_yt:
+        raw = any_yt.group("url").rstrip(").,]\"'")
         if not raw.lower().startswith("http"):
             raw = "https://" + raw
         return raw
+    if BARE_ID_RE.fullmatch(text):
+        return f"https://www.youtube.com/watch?v={text}"
     return None
 
 
@@ -765,6 +771,21 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     return True
 
 
+def cookies_file() -> str | None:
+    env_path = os.getenv("YT_COOKIES_FILE", "").strip()
+    if env_path and Path(env_path).exists():
+        return env_path
+    bundled = DATA_DIR / "cookies.txt"
+    if bundled.exists() and bundled.stat().st_size > 20:
+        return str(bundled)
+    raw = os.getenv("YT_COOKIES", "").strip()
+    if raw:
+        tmp = DATA_DIR / "cookies.env.txt"
+        tmp.write_text(raw.replace("\\n", "\n"), encoding="utf-8")
+        return str(tmp)
+    return None
+
+
 def download_mp3(url: str, workdir: Path) -> dict[str, Any]:
     import yt_dlp
     from yt_dlp.utils import DownloadError, YoutubeDLError
@@ -778,49 +799,60 @@ def download_mp3(url: str, workdir: Path) -> dict[str, Any]:
         return None
 
     outtmpl = str(workdir / "%(id)s.%(ext)s")
-    opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
-        "outtmpl": {"default": outtmpl},
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "overwrites": True,
-        "cachedir": False,
-        "retries": 4,
-        "fragment_retries": 4,
-        "extractor_retries": 3,
-        "socket_timeout": 25,
-        "concurrent_fragment_downloads": 4,
-        "writethumbnail": True,
-        "match_filter": match_filter,
-        "extractor_args": {
-            "youtube": {"player_client": ["android", "ios", "tv", "web"]},
-        },
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": AUDIO_QUALITY,
-            }
-        ],
-        "postprocessor_args": {"ffmpeg": ["-threads", "1"]},
-    }
-
+    cookie = cookies_file()
+    strategies: list[dict[str, Any]] = [
+        {"youtube": {"player_client": ["tv_embedded", "android", "ios"]}},
+        {"youtube": {"player_client": ["android_vr", "mweb"]}},
+        {"youtube": {"player_client": ["web", "tv", "web_safari"]}},
+    ]
+    last_err = ""
     info: dict[str, Any] = {}
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True) or {}
-            if info.get("_type") == "playlist" and info.get("entries"):
-                info = info["entries"][0] or {}
-    except DownloadError as e:
-        raise RuntimeError(humanize_ytdlp_error(str(e))) from e
-    except YoutubeDLError as e:
-        raise RuntimeError(humanize_ytdlp_error(str(e))) from e
+
+    for i, extractor_args in enumerate(strategies, start=1):
+        opts: dict[str, Any] = {
+            "format": "bestaudio[ext=m4a]/bestaudio/best/bestaudio*",
+            "outtmpl": {"default": outtmpl},
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "overwrites": True,
+            "cachedir": False,
+            "retries": 3,
+            "fragment_retries": 5,
+            "extractor_retries": 3,
+            "socket_timeout": 25,
+            "concurrent_fragment_downloads": 4,
+            "writethumbnail": True,
+            "geo_bypass": True,
+            "match_filter": match_filter,
+            "extractor_args": extractor_args,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": AUDIO_QUALITY,
+                }
+            ],
+            "postprocessor_args": {"ffmpeg": ["-threads", "1"]},
+        }
+        if cookie:
+            opts["cookiefile"] = cookie
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True) or {}
+                if info.get("_type") == "playlist" and info.get("entries"):
+                    info = next((e for e in info["entries"] if e), {}) or {}
+            if find_file(workdir, {".mp3"}):
+                break
+        except (DownloadError, YoutubeDLError) as e:
+            last_err = str(e)
+            log.warning("Скачивание попытка %s/%s: %s", i, len(strategies), last_err)
+            continue
 
     mp3 = find_file(workdir, {".mp3"})
     if not mp3:
-        raise RuntimeError("Не получилось собрать MP3. Попробуй другую ссылку.")
+        raise RuntimeError(humanize_ytdlp_error(last_err) if last_err else "Не получилось собрать MP3. Попробуй ещё раз.")
 
     size_mb = mp3.stat().st_size / (1024 * 1024)
     if size_mb > MAX_FILE_MB:
@@ -855,8 +887,8 @@ def humanize_ytdlp_error(msg: str) -> str:
         return "Это прямой эфир — скачать нельзя."
     if "private" in low or "unavailable" in low or "removed" in low:
         return "Видео недоступно (приватное или удалено)."
-    if "sign in" in low or "confirm your age" in low or "age" in low:
-        return "Видео с ограничением возраста, скачать не вышло."
+    if "sign in" in low or "confirm your age" in low or "age-restricted" in low or "age restricted" in low:
+        return "YouTube не отдал аудио с этой ссылки. Пришли ещё раз или другую ссылку на то же видео."
     if "http error 403" in low or "blocked" in low:
         return "YouTube временно заблокировал скачивание с сервера. Попробуй ещё раз через минуту."
     return "Не смог скачать это видео. Проверь ссылку и попробуй ещё раз."
@@ -895,7 +927,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(download_mp3, url, workdir),
-                timeout=180,
+                timeout=240,
             )
             try:
                 await status.edit_text("📤 Отправляю MP3…")
