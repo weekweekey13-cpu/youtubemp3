@@ -8,6 +8,7 @@ __pycache__/
 data/settings.json
 data/stats.json
 data/file_cache.json
+data/subscriptions.json
 data/*.tmp
 tmp/
 downloads/

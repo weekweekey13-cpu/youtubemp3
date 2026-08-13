@@ -66,6 +66,8 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 STATS_PATH = DATA_DIR / "stats.json"
 CACHE_PATH = DATA_DIR / "file_cache.json"
 CACHE_LIMIT = 3000
+SUBS_PATH = DATA_DIR / "subscriptions.json"
+SUBS_EVENT_LIMIT = 400
 
 MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "1200"))  # 20 мин
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "45"))
@@ -214,6 +216,169 @@ def drop_cached_track(video_id: str) -> None:
         if video_id in cache:
             cache.pop(video_id, None)
             save_json(CACHE_PATH, cache)
+
+
+def load_subs() -> dict[str, Any]:
+    data = load_json(SUBS_PATH, {"events": [], "members": {}})
+    if not isinstance(data, dict):
+        data = {"events": [], "members": {}}
+    data.setdefault("events", [])
+    data.setdefault("members", {})
+    return data
+
+
+def format_sub_time(ts: float) -> str:
+    try:
+        from datetime import datetime, timedelta, timezone
+
+        moscow = timezone(timedelta(hours=3))
+        return datetime.fromtimestamp(float(ts), tz=moscow).strftime("%d.%m %H:%M")
+    except Exception:
+        return "—"
+
+
+def display_user(user_id: int, username: str = "", name: str = "") -> str:
+    if username:
+        return f"@{username.lstrip('@')}"
+    if name:
+        return name
+    return f"id {user_id}"
+
+
+def channel_store_key(ch: dict[str, Any]) -> str:
+    if has_numeric_chat(ch):
+        return str(int(str(ch.get("chat_id"))))
+    return str(ch.get("id") or ch.get("username") or "unknown")
+
+
+def record_subscription(
+    *,
+    user_id: int,
+    username: str = "",
+    name: str = "",
+    channel_key: str,
+    channel_title: str,
+    action: str,
+) -> None:
+    if not user_id or not channel_key:
+        return
+    now = time.time()
+    member_key = f"{user_id}:{channel_key}"
+    with settings_lock:
+        data = load_subs()
+        members = data["members"]
+        prev = members.get(member_key) if isinstance(members.get(member_key), dict) else None
+        if action == "check" and prev and prev.get("action") != "leave":
+            prev["last_seen"] = now
+            prev["username"] = username or prev.get("username") or ""
+            prev["name"] = name or prev.get("name") or ""
+            save_json(SUBS_PATH, data)
+            return
+        event = {
+            "user_id": int(user_id),
+            "username": (username or "").lstrip("@"),
+            "name": name or "",
+            "channel_key": channel_key,
+            "channel_title": channel_title,
+            "action": action,
+            "ts": now,
+        }
+        data["events"].append(event)
+        data["events"] = data["events"][-SUBS_EVENT_LIMIT:]
+        if action == "leave":
+            members.pop(member_key, None)
+        else:
+            members[member_key] = {
+                "user_id": int(user_id),
+                "username": (username or "").lstrip("@"),
+                "name": name or "",
+                "channel_key": channel_key,
+                "channel_title": channel_title,
+                "action": action,
+                "joined_at": (prev or {}).get("joined_at") or now,
+                "last_seen": now,
+            }
+        save_json(SUBS_PATH, data)
+
+
+def record_user_on_channels(user, channels: list[dict[str, Any]], action: str) -> None:
+    if user is None:
+        return
+    name = " ".join(x for x in (user.first_name, user.last_name) if x).strip()
+    for ch in channels:
+        record_subscription(
+            user_id=user.id,
+            username=user.username or "",
+            name=name,
+            channel_key=channel_store_key(ch),
+            channel_title=channel_button_title(ch, 1),
+            action=action,
+        )
+
+
+def find_required_channel_for_chat(chat) -> dict[str, Any] | None:
+    if chat is None:
+        return None
+    cid = str(getattr(chat, "id", "") or "")
+    uname = (getattr(chat, "username", None) or "").lower()
+    for ch in load_settings().get("channels") or []:
+        if has_numeric_chat(ch) and str(int(str(ch.get("chat_id")))) == cid:
+            return ch
+        if uname and str(ch.get("username") or "").lower() == uname:
+            return ch
+        if uname and str(ch.get("id") or "").lower() == uname:
+            return ch
+    return None
+
+
+def subs_overview_text(offset: int = 0, page_size: int = 10) -> tuple[str, int]:
+    data = load_subs()
+    events = list(reversed(data.get("events") or []))
+    members = data.get("members") or {}
+    live = [m for m in members.values() if isinstance(m, dict) and m.get("action") != "leave"]
+    by_ch: dict[str, int] = {}
+    for m in live:
+        title = m.get("channel_title") or m.get("channel_key") or "канал"
+        by_ch[title] = by_ch.get(title, 0) + 1
+    total = len(events)
+    chunk = events[offset : offset + page_size]
+    lines = [
+        "👥 <b>Кто подписался</b>",
+        "",
+        f"Сейчас в журнале как подписанные: <b>{len(live)}</b>",
+        f"Событий: <b>{total}</b>",
+    ]
+    if by_ch:
+        lines.append("")
+        lines.append("<b>По каналам:</b>")
+        for title, n in sorted(by_ch.items(), key=lambda x: (-x[1], x[0])):
+            lines.append(f"• {title} — {n}")
+    lines.append("")
+    if not chunk:
+        lines.append("Пока пусто. Записи появятся, когда кто-то вступит или нажмёт «Я подписался».")
+    else:
+        lines.append("<b>Последние:</b>")
+        verbs = {"join": "вступил", "check": "проверили", "leave": "отписался"}
+        for ev in chunk:
+            who = display_user(int(ev.get("user_id") or 0), ev.get("username") or "", ev.get("name") or "")
+            verb = verbs.get(ev.get("action") or "", ev.get("action") or "")
+            ch = ev.get("channel_title") or ev.get("channel_key") or "канал"
+            lines.append(f"{format_sub_time(ev.get('ts') or 0)}  {who} → {ch} ({verb})")
+    return "\n".join(lines), total
+
+
+def subs_keyboard(offset: int, total: int, page_size: int = 10) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    nav: list[InlineKeyboardButton] = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"subs:{max(0, offset - page_size)}"))
+    if offset + page_size < total:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"subs:{offset + page_size}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔄 Обновить", callback_data=f"subs:{offset}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад в админку", callback_data="admin")])
+    return InlineKeyboardMarkup(rows)
 
 
 def is_admin(user) -> bool:
@@ -430,6 +595,7 @@ def admin_keyboard(channels: list[dict[str, Any]]) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🗑", callback_data=f"chdel:{ch.get('id')}"),
             ]
         )
+    rows.append([InlineKeyboardButton("👥 Кто подписался", callback_data="subs:0")])
     rows.append([InlineKeyboardButton("✏️ Текст «Я подписался»", callback_data="checkbtn")])
     rows.append([InlineKeyboardButton("👁 Как видят кнопку подписки", callback_data="subpreview")])
     rows.append([InlineKeyboardButton("➕ Добавить канал", callback_data="chadd")])
@@ -632,7 +798,11 @@ async def ensure_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return True
     missing, broken = await required_missing(context.bot, user.id, channels)
     if not missing and not broken:
+        record_user_on_channels(user, channels, "check")
         return True
+    ok = [c for c in channels if c not in missing and c not in broken]
+    if ok:
+        record_user_on_channels(user, ok, "check")
     await reply_subscribe_gate(update, channels, missing, broken)
     return False
 
@@ -700,6 +870,7 @@ def admin_text() -> str:
         "🛠 <b>Админка YouTube MP3</b>",
         "",
         f"📢 Каналов для подписки: <b>{len(channels)}</b>",
+        f"👥 Подписавшихся в журнале: <b>{sum(1 for m in (load_subs().get('members') or {}).values() if isinstance(m, dict) and m.get('action') != 'leave')}</b>",
         f"⬇️ Скачиваний: <b>{int(stats.get('downloads', 0))}</b>",
         f"👤 Пользователей: <b>{len(stats.get('users') or [])}</b>",
         f"⏱ Аптайм: {h}ч {m}м {s}с",
@@ -782,9 +953,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await reply_subscribe_gate(update, channels, missing, broken)
             return
         if missing or broken:
+            ok = [c for c in channels if c not in missing and c not in broken]
+            if ok:
+                record_user_on_channels(user, ok, "check")
             await query.answer("Ещё не на всех каналах. Подпишись и нажми снова.", show_alert=True)
             await reply_subscribe_gate(update, channels, missing, broken)
             return
+        record_user_on_channels(user, channels, "check")
         await query.edit_message_text(
             "✅ Подписка есть. Кидай ссылку на YouTube — пришлю MP3.",
             reply_markup=user_home_keyboard(is_admin(user), channels),
@@ -798,6 +973,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == "admin":
         pending_action.pop(user.id, None)
         await show_admin(query, context)
+        return
+
+    if data.startswith("subs:"):
+        try:
+            offset = max(0, int(data.split(":", 1)[1]))
+        except ValueError:
+            offset = 0
+        text, total = subs_overview_text(offset)
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=subs_keyboard(offset, total),
+            disable_web_page_preview=True,
+        )
         return
 
     if data == "subpreview":
@@ -1673,6 +1862,51 @@ async def handle_cookies_file(update: Update, context: ContextTypes.DEFAULT_TYPE
     await msg.reply_text("Сохранил cookies. Сложные ролики теперь можно пробовать ещё раз.")
 
 
+def _member_counts_as_in(member) -> bool:
+    if member.status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.OWNER,
+    ):
+        return True
+    if member.status == ChatMemberStatus.RESTRICTED:
+        return bool(getattr(member, "is_member", True))
+    return False
+
+
+async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    event = update.chat_member
+    if not event:
+        return
+    ch = find_required_channel_for_chat(event.chat)
+    if not ch:
+        return
+    new = event.new_chat_member
+    old = event.old_chat_member
+    person = new.user
+    if person.is_bot:
+        return
+    was = _member_counts_as_in(old)
+    now = _member_counts_as_in(new)
+    if now == was:
+        return
+    name = " ".join(x for x in (person.first_name, person.last_name) if x).strip()
+    record_subscription(
+        user_id=person.id,
+        username=person.username or "",
+        name=name,
+        channel_key=channel_store_key(ch),
+        channel_title=channel_button_title(ch, 1),
+        action="join" if now else "leave",
+    )
+    log.info(
+        "Подписка %s: %s → %s",
+        "join" if now else "leave",
+        display_user(person.id, person.username or "", name),
+        channel_button_title(ch, 1),
+    )
+
+
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     event = update.my_chat_member
     if not event:
@@ -1800,6 +2034,7 @@ def main() -> None:
         .build()
     )
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("admin", cmd_admin))
