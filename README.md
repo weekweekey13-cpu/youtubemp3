@@ -10,8 +10,12 @@
 - кнопки «Подписаться» ведут в эти каналы
 - рестарт бота
 
-## Render
+## Ссылки
+
+- GitHub: https://github.com/weekweekey13-cpu/youtubemp3
+- Render: https://youtubemp3-k5ct.onrender.com
+- Health: https://youtubemp3-k5ct.onrender.com/health
 
 `BOT_TOKEN` задаётся только в Environment Variables, в репозиторий не кладётся.
 
-Чтобы бот не засыпал на бесплатном плане — UptimeRobot раз в 5 минут на `https://СЕРВИС.onrender.com/health`.
+Чтобы бот не засыпал на бесплатном плане — UptimeRobot раз в 5 минут на `https://youtubemp3-k5ct.onrender.com/health`.
