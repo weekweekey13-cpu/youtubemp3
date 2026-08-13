@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: youtubemp3
+    runtime: docker
+    plan: free
+    region: frankfurt
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_USERNAMES
+        value: bonamartin69

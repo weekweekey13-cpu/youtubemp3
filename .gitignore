@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.idea/
+.vscode/
+data/settings.json
+data/stats.json
+data/*.tmp
+tmp/
+downloads/
+*.log

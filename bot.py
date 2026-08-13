@@ -1,0 +1,973 @@
+"""
+YouTube → MP3 Telegram-бот.
+
+Пользователь кидает ссылку на YouTube — получает MP3.
+Перед скачиванием обязательна подписка на каналы из админки.
+Админ @bonamartin69: каналы, рестарт.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import shutil
+import signal
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+
+from dotenv import load_dotenv
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageOriginChannel, Update
+from telegram.constants import ChatMemberStatus, ParseMode
+from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+PORT = int(os.getenv("PORT", "10000"))
+ADMIN_USERNAMES = {
+    u.strip().lstrip("@").lower()
+    for u in os.getenv("ADMIN_USERNAMES", "bonamartin69").split(",")
+    if u.strip()
+}
+
+DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT / "data")))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+SETTINGS_PATH = DATA_DIR / "settings.json"
+STATS_PATH = DATA_DIR / "stats.json"
+
+MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "1200"))  # 20 мин
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "45"))
+AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "192")
+
+YOUTUBE_RE = re.compile(
+    r"(?P<url>https?://(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/[^\s<>]+)",
+    re.IGNORECASE,
+)
+YOUTUBE_SHORT_RE = re.compile(
+    r"(?:https?://)?(?:www\.|m\.)?(?:youtube\.com/(?:watch\?v=|shorts/|embed/|live/)|youtu\.be/)[\w\-]{6,}",
+    re.IGNORECASE,
+)
+TG_LINK_RE = re.compile(
+    r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_+]+)",
+    re.IGNORECASE,
+)
+
+STARTED_AT = time.time()
+user_locks: dict[int, asyncio.Lock] = {}
+pending_action: dict[int, str] = {}
+settings_lock = threading.Lock()
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("youtubemp3")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+def default_settings() -> dict[str, Any]:
+    return {"channels": []}
+
+
+def load_json(path: Path, fallback: Any) -> Any:
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        log.exception("Не смог прочитать %s", path)
+    return fallback
+
+
+def save_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_settings() -> dict[str, Any]:
+    with settings_lock:
+        data = load_json(SETTINGS_PATH, default_settings())
+        if not isinstance(data, dict):
+            data = default_settings()
+        data.setdefault("channels", [])
+        return data
+
+
+def save_settings(data: dict[str, Any]) -> None:
+    with settings_lock:
+        save_json(SETTINGS_PATH, data)
+
+
+def load_stats() -> dict[str, Any]:
+    data = load_json(STATS_PATH, {"downloads": 0, "users": []})
+    data.setdefault("downloads", 0)
+    data.setdefault("users", [])
+    return data
+
+
+def bump_stats(user_id: int) -> None:
+    with settings_lock:
+        stats = load_stats()
+        stats["downloads"] = int(stats.get("downloads", 0)) + 1
+        users = set(stats.get("users") or [])
+        users.add(int(user_id))
+        stats["users"] = sorted(users)
+        save_json(STATS_PATH, stats)
+
+
+def is_admin(user) -> bool:
+    if user is None:
+        return False
+    uname = (user.username or "").lstrip("@").lower()
+    return bool(uname) and uname in ADMIN_USERNAMES
+
+
+def get_lock(user_id: int) -> asyncio.Lock:
+    lock = user_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        user_locks[user_id] = lock
+    return lock
+
+
+def extract_youtube_url(text: str) -> str | None:
+    if not text:
+        return None
+    text = text.strip()
+    m = YOUTUBE_RE.search(text)
+    if m:
+        return m.group("url").rstrip(").,]")
+    if YOUTUBE_SHORT_RE.search(text):
+        raw = text.split()[0].rstrip(").,]")
+        if not raw.lower().startswith("http"):
+            raw = "https://" + raw
+        return raw
+    return None
+
+
+def parse_channel_input(text: str) -> dict[str, Any] | None:
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    if text.startswith("@"):
+        username = text[1:].strip()
+        if not username:
+            return None
+        return {
+            "id": username.lower(),
+            "title": "@" + username,
+            "username": username,
+            "chat_id": "@" + username,
+            "url": f"https://t.me/{username}",
+        }
+
+    m = TG_LINK_RE.search(text)
+    if m:
+        slug = m.group(1)
+        url = text if text.lower().startswith("http") else "https://" + text
+        if slug.startswith("+"):
+            return {
+                "id": slug,
+                "title": "Приватный канал",
+                "username": "",
+                "chat_id": "",
+                "url": url if url.startswith("http") else f"https://t.me/{slug}",
+            }
+        return {
+            "id": slug.lower(),
+            "title": "@" + slug,
+            "username": slug,
+            "chat_id": "@" + slug,
+            "url": f"https://t.me/{slug}",
+        }
+
+    if text.startswith("-") and text[1:].isdigit():
+        return {
+            "id": text,
+            "title": f"Чат {text}",
+            "username": "",
+            "chat_id": int(text),
+            "url": "",
+        }
+    return None
+
+
+def channel_button_title(ch: dict[str, Any], index: int) -> str:
+    title = (ch.get("title") or "").strip()
+    if title:
+        return title[:40]
+    username = (ch.get("username") or "").strip()
+    if username:
+        return "@" + username.lstrip("@")
+    return f"Канал {index}"
+
+
+def fmt_duration(sec: int | float | None) -> str:
+    if not sec:
+        return "—"
+    sec = int(sec)
+    m, s = divmod(sec, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def safe_filename(name: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|]+', " ", name).strip(" .")
+    name = re.sub(r"\s+", " ", name)
+    return (name or "audio")[:80]
+
+
+def subscribe_keyboard(channels: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for i, ch in enumerate(channels, start=1):
+        url = (ch.get("url") or "").strip()
+        username = (ch.get("username") or "").strip().lstrip("@")
+        if not url and username:
+            url = f"https://t.me/{username}"
+        if not url:
+            continue
+        rows.append(
+            [InlineKeyboardButton(f"📢 Подписаться · {channel_button_title(ch, i)}", url=url)]
+        )
+    rows.append([InlineKeyboardButton("✅ Я подписался", callback_data="check_sub")])
+    return InlineKeyboardMarkup(rows)
+
+
+def user_home_keyboard(admin: bool) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("🎵 Как скачать?", callback_data="help")]]
+    if admin:
+        rows.append([InlineKeyboardButton("🛠 Админка", callback_data="admin")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_keyboard(channels: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for i, ch in enumerate(channels):
+        title = channel_button_title(ch, i + 1)
+        rows.append(
+            [
+                InlineKeyboardButton(f"📢 {title}", callback_data=f"chinfo:{ch.get('id')}"),
+                InlineKeyboardButton("🗑", callback_data=f"chdel:{ch.get('id')}"),
+            ]
+        )
+    rows.append([InlineKeyboardButton("➕ Добавить канал", callback_data="chadd")])
+    rows.append([InlineKeyboardButton("♻️ Рестарт бота", callback_data="restart_ask")])
+    rows.append([InlineKeyboardButton("🔄 Обновить", callback_data="admin")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def required_missing(
+    bot, user_id: int, channels: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    missing: list[dict[str, Any]] = []
+    for ch in channels:
+        chat_id = ch.get("chat_id") or (
+            "@" + ch["username"].lstrip("@") if ch.get("username") else None
+        )
+        if not chat_id:
+            missing.append(ch)
+            continue
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+            if member.status in (
+                ChatMemberStatus.LEFT,
+                ChatMemberStatus.BANNED,
+            ):
+                missing.append(ch)
+        except Forbidden:
+            log.warning("Бот не админ в %s — не могу проверить подписку", chat_id)
+            missing.append(ch)
+        except BadRequest as e:
+            log.warning("Проверка %s: %s", chat_id, e)
+            missing.append(ch)
+        except TelegramError as e:
+            log.warning("Проверка %s: %s", chat_id, e)
+            missing.append(ch)
+    return missing
+
+
+async def ensure_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    if is_admin(user):
+        return True
+    channels = load_settings().get("channels") or []
+    if not channels:
+        return True
+    missing = await required_missing(context.bot, user.id, channels)
+    if not missing:
+        return True
+    text = (
+        "🔒 <b>Сначала подпишись на каналы</b>\n\n"
+        "Без подписки скачивание недоступно.\n"
+        "Нажми «Подписаться», вступи, затем «Я подписался»."
+    )
+    markup = subscribe_keyboard(channels)
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(
+                text, parse_mode=ParseMode.HTML, reply_markup=markup, disable_web_page_preview=True
+            )
+        except BadRequest:
+            await update.callback_query.message.reply_html(
+                text, reply_markup=markup, disable_web_page_preview=True
+            )
+    elif update.effective_message:
+        await update.effective_message.reply_html(
+            text, reply_markup=markup, disable_web_page_preview=True
+        )
+    return False
+
+
+def welcome_text(admin: bool) -> str:
+    extra = "\n\n🛠 Тебе доступна <b>админка</b>." if admin else ""
+    return (
+        "🎵 <b>YouTube → MP3</b>\n\n"
+        "Кинь ссылку на видео — я быстро и бесплатно сделаю MP3.\n\n"
+        "Подходит:\n"
+        "• youtube.com/watch?v=…\n"
+        "• youtu.be/…\n"
+        "• youtube.com/shorts/…\n"
+        "• music.youtube.com/…\n\n"
+        f"Лимит: до {MAX_DURATION_SEC // 60} минут.{extra}"
+    )
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    pending_action.pop(user.id, None)
+    await update.message.reply_html(
+        welcome_text(is_admin(user)),
+        reply_markup=user_home_keyboard(is_admin(user)),
+        disable_web_page_preview=True,
+    )
+    channels = load_settings().get("channels") or []
+    if channels and not is_admin(user):
+        missing = await required_missing(context.bot, user.id, channels)
+        if missing:
+            await update.message.reply_html(
+                "🔒 Чтобы скачивать — подпишись на каналы ниже, потом пришли ссылку.",
+                reply_markup=subscribe_keyboard(channels),
+                disable_web_page_preview=True,
+            )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        await update.message.reply_html(
+            welcome_text(is_admin(update.effective_user)),
+            reply_markup=user_home_keyboard(is_admin(update.effective_user)),
+        )
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not is_admin(update.effective_user):
+        if update.message:
+            await update.message.reply_text("Недостаточно прав.")
+        return
+    await update.message.reply_html(admin_text(), reply_markup=admin_keyboard(load_settings()["channels"]))
+
+
+def admin_text() -> str:
+    settings = load_settings()
+    stats = load_stats()
+    channels = settings.get("channels") or []
+    uptime = int(time.time() - STARTED_AT)
+    h, rem = divmod(uptime, 3600)
+    m, s = divmod(rem, 60)
+    lines = [
+        "🛠 <b>Админка YouTube MP3</b>",
+        "",
+        f"📢 Каналов для подписки: <b>{len(channels)}</b>",
+        f"⬇️ Скачиваний: <b>{int(stats.get('downloads', 0))}</b>",
+        f"👤 Пользователей: <b>{len(stats.get('users') or [])}</b>",
+        f"⏱ Аптайм: {h}ч {m}м {s}с",
+        "",
+        "Добавляй/убирай каналы. Бот должен быть <b>админом</b> каждого канала, иначе не проверит подписку.",
+        "",
+        "Чтобы добавить: нажми «Добавить канал» и пришли ссылку вида",
+        "<code>https://t.me/channel</code> или <code>@channel</code>.",
+    ]
+    if channels:
+        lines.append("")
+        lines.append("<b>Сейчас обязательны:</b>")
+        for i, ch in enumerate(channels, start=1):
+            url = ch.get("url") or ""
+            title = channel_button_title(ch, i)
+            lines.append(f"{i}. {title}" + (f" — {url}" if url else ""))
+    return "\n".join(lines)
+
+
+async def show_admin(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await query.edit_message_text(
+            admin_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_keyboard(load_settings()["channels"]),
+            disable_web_page_preview=True,
+        )
+    except BadRequest:
+        await query.message.reply_html(
+            admin_text(),
+            reply_markup=admin_keyboard(load_settings()["channels"]),
+            disable_web_page_preview=True,
+        )
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if not query or not user:
+        return
+    data = query.data or ""
+    await query.answer()
+
+    if data == "help":
+        try:
+            await query.edit_message_text(
+                welcome_text(is_admin(user)),
+                parse_mode=ParseMode.HTML,
+                reply_markup=user_home_keyboard(is_admin(user)),
+            )
+        except BadRequest:
+            pass
+        return
+
+    if data == "check_sub":
+        channels = load_settings().get("channels") or []
+        if not channels:
+            await query.edit_message_text(
+                "✅ Ограничений нет. Пришли ссылку на YouTube.",
+                reply_markup=user_home_keyboard(is_admin(user)),
+            )
+            return
+        missing = await required_missing(context.bot, user.id, channels)
+        if missing:
+            await query.answer("Ещё не на всех каналах. Подпишись и нажми снова.", show_alert=True)
+            try:
+                await query.edit_message_text(
+                    "🔒 Подписка ещё не полная. Открой каналы кнопками ниже, вступи, затем снова «Я подписался».",
+                    reply_markup=subscribe_keyboard(channels),
+                )
+            except BadRequest:
+                pass
+            return
+        await query.edit_message_text(
+            "✅ Подписка есть. Кидай ссылку на YouTube — пришлю MP3.",
+            reply_markup=user_home_keyboard(is_admin(user)),
+        )
+        return
+
+    if not is_admin(user):
+        await query.answer("Только для админа.", show_alert=True)
+        return
+
+    if data == "admin":
+        pending_action.pop(user.id, None)
+        await show_admin(query, context)
+        return
+
+    if data == "chadd":
+        pending_action[user.id] = "add_channel"
+        await query.edit_message_text(
+            "➕ Пришли ссылку на канал:\n\n"
+            "<code>https://t.me/имя</code>\n"
+            "<code>@имя</code>\n\n"
+            "Для приватного канала сначала добавь бота админом, "
+            "затем пришли ссылку-приглашение или id чата (например <code>-100123…</code>).\n\n"
+            "Отмена: /start",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="admin")]]
+            ),
+        )
+        return
+
+    if data.startswith("chdel:"):
+        ch_id = data.split(":", 1)[1]
+        settings = load_settings()
+        before = len(settings["channels"])
+        settings["channels"] = [c for c in settings["channels"] if str(c.get("id")) != ch_id]
+        save_settings(settings)
+        removed = before - len(settings["channels"])
+        await query.answer("Удалил." if removed else "Уже нет.")
+        await show_admin(query, context)
+        return
+
+    if data.startswith("chinfo:"):
+        ch_id = data.split(":", 1)[1]
+        ch = next((c for c in load_settings()["channels"] if str(c.get("id")) == ch_id), None)
+        if not ch:
+            await query.answer("Канал не найден.")
+            await show_admin(query, context)
+            return
+        chat_id = ch.get("chat_id") or ""
+        status = "не проверял"
+        if chat_id:
+            try:
+                me = await context.bot.get_chat_member(chat_id, context.bot.id)
+                status = f"бот в канале: {me.status}"
+            except Exception as e:
+                status = f"ошибка проверки: {e}"
+        text = (
+            f"📢 <b>{channel_button_title(ch, 1)}</b>\n\n"
+            f"id: <code>{ch.get('id')}</code>\n"
+            f"chat_id: <code>{chat_id or '—'}</code>\n"
+            f"ссылка: {ch.get('url') or '—'}\n"
+            f"{status}\n\n"
+            "Бот должен быть администратором канала."
+        )
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🗑 Убрать из обязательных", callback_data=f"chdel:{ch_id}")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="admin")],
+                ]
+            ),
+        )
+        return
+
+    if data == "restart_ask":
+        await query.edit_message_text(
+            "♻️ Перезапустить бота сейчас?\nНа Render процесс завершится и сервис поднимется заново.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Да, рестарт", callback_data="restart_now")],
+                    [InlineKeyboardButton("Отмена", callback_data="admin")],
+                ]
+            ),
+        )
+        return
+
+    if data == "restart_now":
+        await query.edit_message_text("♻️ Перезапускаю… Напиши /start через 20–40 секунд.")
+        log.info("Админ %s запросил рестарт", user.username)
+        await asyncio.sleep(0.4)
+        os._exit(0)
+
+
+async def resolve_channel(bot, parsed: dict[str, Any]) -> dict[str, Any]:
+    chat_id = parsed.get("chat_id")
+    if not chat_id:
+        return parsed
+    try:
+        chat = await bot.get_chat(chat_id)
+        parsed["title"] = chat.title or parsed.get("title") or str(chat_id)
+        if chat.username:
+            parsed["username"] = chat.username
+            parsed["chat_id"] = "@" + chat.username
+            parsed["url"] = f"https://t.me/{chat.username}"
+            parsed["id"] = chat.username.lower()
+        else:
+            parsed["chat_id"] = chat.id
+            parsed["id"] = str(chat.id)
+            if not parsed.get("url"):
+                try:
+                    invite = await bot.export_chat_invite_link(chat.id)
+                    parsed["url"] = invite
+                except TelegramError:
+                    pass
+        return parsed
+    except TelegramError as e:
+        parsed["resolve_error"] = str(e)
+        return parsed
+
+
+async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    user = update.effective_user
+    if not user or not is_admin(user):
+        return False
+    action = pending_action.get(user.id)
+    if action != "add_channel":
+        return False
+
+    parsed = parse_channel_input(text)
+    if not parsed:
+        await update.message.reply_html(
+            "Не понял ссылку. Пришли <code>https://t.me/канал</code> или <code>@канал</code>."
+        )
+        return True
+
+    parsed = await resolve_channel(context.bot, parsed)
+    settings = load_settings()
+    existing_ids = {str(c.get("id")) for c in settings["channels"]}
+    existing_chats = {str(c.get("chat_id")) for c in settings["channels"]}
+    if str(parsed.get("id")) in existing_ids or str(parsed.get("chat_id")) in existing_chats:
+        pending_action.pop(user.id, None)
+        await update.message.reply_text("Этот канал уже в списке.")
+        await update.message.reply_html(admin_text(), reply_markup=admin_keyboard(settings["channels"]))
+        return True
+
+    if not parsed.get("url") and parsed.get("username"):
+        parsed["url"] = f"https://t.me/{parsed['username']}"
+
+    if not parsed.get("url"):
+        await update.message.reply_html(
+            "Сохранил канал, но нет публичной ссылки. "
+            "Пользователь не сможет нажать «Подписаться». "
+            "Добавь бота админом и пришли ссылку-приглашение ещё раз."
+        )
+
+    warn = ""
+    chat_id = parsed.get("chat_id")
+    if chat_id:
+        try:
+            me = await context.bot.get_chat_member(chat_id, context.bot.id)
+            if me.status not in (
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.OWNER,
+            ):
+                warn = (
+                    "\n\n⚠️ Бот не админ этого канала — проверка подписки не сработает. "
+                    "Добавь @dowloadmp3youtube_mp3bot админом."
+                )
+        except TelegramError:
+            warn = (
+                "\n\n⚠️ Не смог заглянуть в канал. Добавь бота админом "
+                "(@dowloadmp3youtube_mp3bot), иначе подписку не проверить."
+            )
+    elif parsed.get("url", "").find("+") != -1:
+        warn = (
+            "\n\n⚠️ Приватный инвайт. Напиши ещё id канала (число вроде <code>-100…</code>) "
+            "после того, как добавишь бота админом — или перешли любое сообщение из канала."
+        )
+
+    settings["channels"].append(parsed)
+    save_settings(settings)
+    pending_action.pop(user.id, None)
+    title = channel_button_title(parsed, len(settings["channels"]))
+    await update.message.reply_html(
+        f"✅ Добавил <b>{title}</b>. Пользователи должны на него подписаться.{warn}",
+        disable_web_page_preview=True,
+    )
+    await update.message.reply_html(admin_text(), reply_markup=admin_keyboard(settings["channels"]))
+    return True
+
+
+def download_mp3(url: str, workdir: Path) -> dict[str, Any]:
+    import yt_dlp
+    from yt_dlp.utils import DownloadError, YoutubeDLError
+
+    def match_filter(info, *, incomplete=False):
+        if info.get("is_live") or info.get("live_status") in {"is_live", "is_upcoming"}:
+            return "Это прямой эфир, скачать нельзя"
+        duration = info.get("duration")
+        if duration and int(duration) > MAX_DURATION_SEC:
+            return f"Видео длиннее {MAX_DURATION_SEC // 60} минут"
+        return None
+
+    outtmpl = str(workdir / "%(id)s.%(ext)s")
+    opts = {
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl": {"default": outtmpl},
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "overwrites": True,
+        "cachedir": False,
+        "retries": 4,
+        "fragment_retries": 4,
+        "extractor_retries": 3,
+        "socket_timeout": 25,
+        "concurrent_fragment_downloads": 4,
+        "writethumbnail": True,
+        "match_filter": match_filter,
+        "extractor_args": {
+            "youtube": {"player_client": ["android", "ios", "tv", "web"]},
+        },
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": AUDIO_QUALITY,
+            }
+        ],
+        "postprocessor_args": {"ffmpeg": ["-threads", "1"]},
+    }
+
+    info: dict[str, Any] = {}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True) or {}
+            if info.get("_type") == "playlist" and info.get("entries"):
+                info = info["entries"][0] or {}
+    except DownloadError as e:
+        raise RuntimeError(humanize_ytdlp_error(str(e))) from e
+    except YoutubeDLError as e:
+        raise RuntimeError(humanize_ytdlp_error(str(e))) from e
+
+    mp3 = find_file(workdir, {".mp3"})
+    if not mp3:
+        raise RuntimeError("Не получилось собрать MP3. Попробуй другую ссылку.")
+
+    size_mb = mp3.stat().st_size / (1024 * 1024)
+    if size_mb > MAX_FILE_MB:
+        mp3.unlink(missing_ok=True)
+        raise RuntimeError(f"Файл слишком большой ({size_mb:.0f} МБ). Лимит Telegram — {MAX_FILE_MB} МБ.")
+
+    thumb = find_file(workdir, {".jpg", ".jpeg", ".png", ".webp"})
+    return {
+        "path": mp3,
+        "thumb": thumb,
+        "title": (info.get("title") or "YouTube audio").strip(),
+        "artist": (info.get("uploader") or info.get("channel") or "YouTube").strip(),
+        "duration": int(info.get("duration") or 0),
+        "webpage_url": info.get("webpage_url") or url,
+        "id": info.get("id") or "",
+    }
+
+
+def find_file(folder: Path, exts: set[str]) -> Path | None:
+    files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in exts]
+    if not files:
+        return None
+    files.sort(key=lambda p: p.stat().st_size, reverse=True)
+    return files[0]
+
+
+def humanize_ytdlp_error(msg: str) -> str:
+    low = msg.lower()
+    if "too long" in low or "длиннее" in low:
+        return f"Видео длиннее {MAX_DURATION_SEC // 60} минут."
+    if "live" in low or "эфир" in low:
+        return "Это прямой эфир — скачать нельзя."
+    if "private" in low or "unavailable" in low or "removed" in low:
+        return "Видео недоступно (приватное или удалено)."
+    if "sign in" in low or "confirm your age" in low or "age" in low:
+        return "Видео с ограничением возраста, скачать не вышло."
+    if "http error 403" in low or "blocked" in low:
+        return "YouTube временно заблокировал скачивание с сервера. Попробуй ещё раз через минуту."
+    return "Не смог скачать это видео. Проверь ссылку и попробуй ещё раз."
+
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    text = msg.text or msg.caption or ""
+
+    if await handle_admin_text(update, context, text):
+        return
+
+    url = extract_youtube_url(text)
+    if not url:
+        if is_admin(user) and pending_action.get(user.id) == "add_channel":
+            return
+        await msg.reply_html(
+            "Пришли обычную ссылку на YouTube.\nНапример: <code>https://youtu.be/dQw4w9WgXcQ</code>"
+        )
+        return
+
+    if not await ensure_subscribed(update, context):
+        return
+
+    lock = get_lock(user.id)
+    if lock.locked():
+        await msg.reply_text("Уже качаю твой предыдущий трек. Подожди немного.")
+        return
+
+    async with lock:
+        status = await msg.reply_text("⬇️ Скачиваю аудио и делаю MP3… это быстро.")
+        workdir = Path(tempfile.mkdtemp(prefix="ytmp3_", dir=str(DATA_DIR)))
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(download_mp3, url, workdir),
+                timeout=180,
+            )
+            try:
+                await status.edit_text("📤 Отправляю MP3…")
+            except BadRequest:
+                pass
+
+            thumb_file = None
+            audio_file = open(result["path"], "rb")
+            try:
+                kwargs: dict[str, Any] = {
+                    "audio": audio_file,
+                    "filename": f"{safe_filename(result['title'])}.mp3",
+                    "title": result["title"][:64],
+                    "performer": result["artist"][:64],
+                    "caption": f"🎵 {result['title']}\n⏱ {fmt_duration(result['duration'])}",
+                }
+                if result["duration"]:
+                    kwargs["duration"] = result["duration"]
+                if result["thumb"] and result["thumb"].exists():
+                    thumb_file = open(result["thumb"], "rb")
+                    kwargs["thumbnail"] = thumb_file
+                await msg.reply_audio(**kwargs)
+            finally:
+                audio_file.close()
+                if thumb_file:
+                    thumb_file.close()
+
+            bump_stats(user.id)
+            try:
+                await status.delete()
+            except TelegramError:
+                pass
+        except asyncio.TimeoutError:
+            await status.edit_text("⏱ Слишком долго качается. Попробуй другое видео или ещё раз.")
+        except RuntimeError as e:
+            try:
+                await status.edit_text(f"❌ {e}")
+            except BadRequest:
+                await msg.reply_text(f"❌ {e}")
+        except TelegramError as e:
+            log.exception("Telegram send failed")
+            try:
+                await status.edit_text(f"❌ Не смог отправить файл: {e}")
+            except BadRequest:
+                pass
+        except Exception:
+            log.exception("Download failed")
+            try:
+                await status.edit_text("❌ Ошибка при скачивании. Попробуй другую ссылку.")
+            except BadRequest:
+                pass
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+
+    if is_admin(user) and pending_action.get(user.id) == "add_channel":
+        origin = getattr(msg, "forward_origin", None)
+        chat = None
+        if isinstance(origin, MessageOriginChannel):
+            chat = origin.chat
+        elif getattr(msg, "forward_from_chat", None):
+            chat = msg.forward_from_chat
+        if chat:
+            username = getattr(chat, "username", None) or ""
+            parsed = {
+                "id": (username.lower() if username else str(chat.id)),
+                "title": chat.title or (f"@{username}" if username else str(chat.id)),
+                "username": username,
+                "chat_id": f"@{username}" if username else chat.id,
+                "url": f"https://t.me/{username}" if username else "",
+            }
+            fake_text = parsed["url"] or str(parsed["chat_id"])
+            pending_action[user.id] = "add_channel"
+            await handle_admin_text(
+                update,
+                context,
+                fake_text if username else str(chat.id),
+            )
+            return
+
+    await handle_link(update, context)
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt: str, *args) -> None:
+        return
+
+    def _ok(self, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        path = urlparse(self.path).path
+        if path in ("/", "/health", "/api/ping", "/api/health"):
+            self._ok(
+                {
+                    "ok": True,
+                    "service": "youtubemp3",
+                    "uptime_sec": int(time.time() - STARTED_AT),
+                }
+            )
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        path = urlparse(self.path).path
+        if path in ("/", "/health", "/api/ping", "/api/health"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.end_headers()
+
+
+def start_http() -> None:
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True, name="http")
+    thread.start()
+    log.info("HTTP health on :%s", PORT)
+
+
+def main() -> None:
+    if not BOT_TOKEN:
+        print("Нет BOT_TOKEN. Пропиши его в .env или в переменных Render.", file=sys.stderr)
+        sys.exit(1)
+
+    if not shutil.which("ffmpeg"):
+        log.warning("ffmpeg не найден в PATH — конвертация в MP3 может не сработать")
+
+    start_http()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .build()
+    )
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.FORWARDED, handle_forward))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    app.add_handler(MessageHandler(filters.Entity("url") | filters.CaptionEntity("url"), handle_link))
+
+    def _stop(*_args) -> None:
+        log.info("stop signal")
+
+    signal.signal(signal.SIGTERM, _stop)
+    log.info("Бот запущен. Админы: %s", ", ".join(sorted(ADMIN_USERNAMES)) or "—")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()

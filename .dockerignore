@@ -1,0 +1,12 @@
+.env
+.venv
+.git
+__pycache__
+*.pyc
+*.md
+*.bat
+data/settings.json
+data/stats.json
+data/*.tmp
+tmp
+downloads
