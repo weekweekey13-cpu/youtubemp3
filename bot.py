@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -22,6 +23,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -771,6 +773,136 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     return True
 
 
+HTTP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+
+
+def youtube_id(url: str) -> str | None:
+    m = VIDEO_ID_RE.search(url or "")
+    return m.group(1) if m else None
+
+
+def http_json(method: str, url: str, payload: dict | None = None, headers: dict | None = None, timeout: int = 25) -> dict[str, Any]:
+    hdrs = {"User-Agent": HTTP_UA, "Accept": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        hdrs.setdefault("Content-Type", "application/json")
+    req = Request(url, data=data, headers=hdrs, method=method)
+    with urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    if not raw:
+        return {}
+    parsed = json.loads(raw.decode("utf-8", "replace"))
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def http_download(url: str, dest: Path, timeout: int = 90) -> None:
+    req = Request(url, headers={"User-Agent": HTTP_UA, "Accept": "*/*"})
+    limit = MAX_FILE_MB * 1024 * 1024
+    with urlopen(req, timeout=timeout) as resp, dest.open("wb") as out:
+        n = 0
+        while True:
+            chunk = resp.read(64 * 1024)
+            if not chunk:
+                break
+            n += len(chunk)
+            if n > limit:
+                dest.unlink(missing_ok=True)
+                raise RuntimeError(f"Файл слишком большой. Лимит Telegram — {MAX_FILE_MB} МБ.")
+            out.write(chunk)
+    if not dest.exists() or dest.stat().st_size < 1000:
+        raise RuntimeError("Пустой файл, YouTube не отдал аудио.")
+
+
+def convert_to_mp3(src: Path, dest: Path) -> None:
+    if src.suffix.lower() == ".mp3":
+        if src.resolve() != dest.resolve():
+            shutil.copy2(src, dest)
+        return
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-vn",
+        "-acodec",
+        "libmp3lame",
+        "-b:a",
+        f"{AUDIO_QUALITY}k",
+        str(dest),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, timeout=120)
+    if proc.returncode != 0 or not dest.exists() or dest.stat().st_size < 1000:
+        err = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
+        raise RuntimeError(f"Не смог сконвертировать в MP3. {err}".strip())
+
+
+def pick_best_audio(medias: list[dict[str, Any]]) -> dict[str, Any] | None:
+    audios = [m for m in medias if m.get("url") and str(m.get("type") or "").lower() == "audio"]
+    if not audios:
+        return None
+
+    def score(item: dict[str, Any]) -> tuple[int, int]:
+        ext = str(item.get("ext") or "").lower()
+        pref = 3 if ext == "m4a" else 2 if ext == "mp3" else 1 if ext in {"opus", "webm"} else 0
+        nums = re.findall(r"(\d+)", str(item.get("quality") or item.get("label") or ""))
+        br = max((int(n) for n in nums), default=0)
+        return (pref, br)
+
+    return max(audios, key=score)
+
+
+def download_via_clipto(url: str, workdir: Path) -> dict[str, Any] | None:
+    try:
+        data = http_json(
+            "POST",
+            "https://www.clipto.com/api/youtube",
+            {"url": url},
+            {
+                "Origin": "https://www.clipto.com",
+                "Referer": "https://www.clipto.com/",
+            },
+            timeout=30,
+        )
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
+        log.warning("Clipto ошибка: %s", e)
+        return None
+    if not data.get("success"):
+        log.warning("Clipto: видео недоступно (%s)", data.get("error") or data.get("message") or data)
+        raise RuntimeError("UNAVAILABLE")
+    media = pick_best_audio(data.get("medias") or [])
+    if not media:
+        log.warning("Clipto: нет аудиодорожки")
+        return None
+    ext = str(media.get("ext") or "m4a").lstrip(".")
+    raw_path = workdir / f"src.{ext}"
+    http_download(media["url"], raw_path)
+    mp3_path = workdir / "audio.mp3"
+    convert_to_mp3(raw_path, mp3_path)
+    duration = int(data.get("duration") or 0)
+    if duration and duration > MAX_DURATION_SEC:
+        mp3_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Видео длиннее {MAX_DURATION_SEC // 60} минут.")
+    return {
+        "path": mp3_path,
+        "thumb": None,
+        "title": (data.get("title") or "YouTube audio").strip(),
+        "artist": (data.get("author") or "YouTube").strip() or "YouTube",
+        "duration": duration,
+        "webpage_url": url,
+        "id": youtube_id(url) or "",
+    }
+
+
 def cookies_file() -> str | None:
     env_path = os.getenv("YT_COOKIES_FILE", "").strip()
     if env_path and Path(env_path).exists():
@@ -786,7 +918,7 @@ def cookies_file() -> str | None:
     return None
 
 
-def download_mp3(url: str, workdir: Path) -> dict[str, Any]:
+def download_via_ytdlp(url: str, workdir: Path) -> dict[str, Any] | None:
     import yt_dlp
     from yt_dlp.utils import DownloadError, YoutubeDLError
 
@@ -798,77 +930,81 @@ def download_mp3(url: str, workdir: Path) -> dict[str, Any]:
             return f"Видео длиннее {MAX_DURATION_SEC // 60} минут"
         return None
 
-    outtmpl = str(workdir / "%(id)s.%(ext)s")
+    outtmpl = str(workdir / "ytdlp.%(ext)s")
     cookie = cookies_file()
-    strategies: list[dict[str, Any]] = [
-        {"youtube": {"player_client": ["tv_embedded", "android", "ios"]}},
-        {"youtube": {"player_client": ["android_vr", "mweb"]}},
-        {"youtube": {"player_client": ["web", "tv", "web_safari"]}},
-    ]
-    last_err = ""
-    info: dict[str, Any] = {}
-
-    for i, extractor_args in enumerate(strategies, start=1):
-        opts: dict[str, Any] = {
-            "format": "bestaudio[ext=m4a]/bestaudio/best/bestaudio*",
-            "outtmpl": {"default": outtmpl},
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "noprogress": True,
-            "overwrites": True,
-            "cachedir": False,
-            "retries": 3,
-            "fragment_retries": 5,
-            "extractor_retries": 3,
-            "socket_timeout": 25,
-            "concurrent_fragment_downloads": 4,
-            "writethumbnail": True,
-            "geo_bypass": True,
-            "match_filter": match_filter,
-            "extractor_args": extractor_args,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": AUDIO_QUALITY,
-                }
-            ],
-            "postprocessor_args": {"ffmpeg": ["-threads", "1"]},
-        }
-        if cookie:
-            opts["cookiefile"] = cookie
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True) or {}
-                if info.get("_type") == "playlist" and info.get("entries"):
-                    info = next((e for e in info["entries"] if e), {}) or {}
-            if find_file(workdir, {".mp3"}):
-                break
-        except (DownloadError, YoutubeDLError) as e:
-            last_err = str(e)
-            log.warning("Скачивание попытка %s/%s: %s", i, len(strategies), last_err)
-            continue
-
+    opts: dict[str, Any] = {
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl": {"default": outtmpl},
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "overwrites": True,
+        "cachedir": False,
+        "retries": 2,
+        "fragment_retries": 3,
+        "extractor_retries": 2,
+        "socket_timeout": 20,
+        "geo_bypass": True,
+        "match_filter": match_filter,
+        "extractor_args": {"youtube": {"player_client": ["tv_embedded", "android", "ios"]}},
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": AUDIO_QUALITY,
+            }
+        ],
+        "postprocessor_args": {"ffmpeg": ["-threads", "1"]},
+    }
+    if cookie:
+        opts["cookiefile"] = cookie
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True) or {}
+            if info.get("_type") == "playlist" and info.get("entries"):
+                info = next((e for e in info["entries"] if e), {}) or {}
+    except (DownloadError, YoutubeDLError) as e:
+        log.warning("yt-dlp: %s", e)
+        raise RuntimeError(str(e)) from e
     mp3 = find_file(workdir, {".mp3"})
     if not mp3:
-        raise RuntimeError(humanize_ytdlp_error(last_err) if last_err else "Не получилось собрать MP3. Попробуй ещё раз.")
-
-    size_mb = mp3.stat().st_size / (1024 * 1024)
-    if size_mb > MAX_FILE_MB:
-        mp3.unlink(missing_ok=True)
-        raise RuntimeError(f"Файл слишком большой ({size_mb:.0f} МБ). Лимит Telegram — {MAX_FILE_MB} МБ.")
-
-    thumb = find_file(workdir, {".jpg", ".jpeg", ".png", ".webp"})
+        return None
     return {
         "path": mp3,
-        "thumb": thumb,
+        "thumb": find_file(workdir, {".jpg", ".jpeg", ".png", ".webp"}),
         "title": (info.get("title") or "YouTube audio").strip(),
         "artist": (info.get("uploader") or info.get("channel") or "YouTube").strip(),
         "duration": int(info.get("duration") or 0),
         "webpage_url": info.get("webpage_url") or url,
-        "id": info.get("id") or "",
+        "id": info.get("id") or youtube_id(url) or "",
     }
+
+
+def download_mp3(url: str, workdir: Path) -> dict[str, Any]:
+    last_err = ""
+    try:
+        got = download_via_clipto(url, workdir)
+        if got:
+            log.info("Скачал через запасной сервер: %s", got.get("title"))
+            return got
+    except RuntimeError as e:
+        if str(e) == "UNAVAILABLE":
+            raise RuntimeError("Это видео недоступно (удалено, приватное или заблокировано).") from e
+        last_err = str(e)
+        log.warning("Clipto runtime: %s", e)
+    except Exception as e:
+        last_err = str(e)
+        log.warning("Clipto unexpected: %s", e)
+
+    try:
+        got = download_via_ytdlp(url, workdir)
+        if got:
+            return got
+    except RuntimeError as e:
+        last_err = str(e)
+
+    raise RuntimeError(humanize_ytdlp_error(last_err) if last_err else "Не получилось скачать. Попробуй другую ссылку.")
 
 
 def find_file(folder: Path, exts: set[str]) -> Path | None:
@@ -880,17 +1016,19 @@ def find_file(folder: Path, exts: set[str]) -> Path | None:
 
 
 def humanize_ytdlp_error(msg: str) -> str:
-    low = msg.lower()
+    low = (msg or "").lower()
     if "too long" in low or "длиннее" in low:
         return f"Видео длиннее {MAX_DURATION_SEC // 60} минут."
     if "live" in low or "эфир" in low:
         return "Это прямой эфир — скачать нельзя."
-    if "private" in low or "unavailable" in low or "removed" in low:
-        return "Видео недоступно (приватное или удалено)."
-    if "sign in" in low or "confirm your age" in low or "age-restricted" in low or "age restricted" in low:
-        return "YouTube не отдал аудио с этой ссылки. Пришли ещё раз или другую ссылку на то же видео."
+    if "unavailable" in low or "private" in low or "removed" in low or "удалено" in low:
+        return "Это видео недоступно (удалено, приватное или заблокировано)."
+    if "not a bot" in low or "sign in to confirm" in low:
+        return "YouTube режет сервер. Подожди минуту и кинь ссылку ещё раз."
+    if "age" in low and "restrict" in low:
+        return "Не смог обойти ограничение на этом ролике. Попробуй другую ссылку на него."
     if "http error 403" in low or "blocked" in low:
-        return "YouTube временно заблокировал скачивание с сервера. Попробуй ещё раз через минуту."
+        return "Сервер временно не отдал файл. Попробуй ещё раз через минуту."
     return "Не смог скачать это видео. Проверь ссылку и попробуй ещё раз."
 
 
