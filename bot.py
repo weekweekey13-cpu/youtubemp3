@@ -28,7 +28,15 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageOriginChannel, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    MessageOriginChannel,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatMemberStatus, ChatType, ParseMode
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
@@ -382,6 +390,27 @@ def subscribe_keyboard(channels: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(subscribe_rows(channels))
 
 
+BTN_START = "🚀 Старт"
+BTN_ADMIN = "🛠 Админка"
+
+
+def is_start_text(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return t in {"🚀 старт", "старт", "start", "/start"}
+
+
+def is_admin_btn_text(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return t in {"🛠 админка", "админка"}
+
+
+def bottom_keyboard(admin: bool) -> ReplyKeyboardMarkup:
+    row = [KeyboardButton(BTN_START)]
+    if admin:
+        row.append(KeyboardButton(BTN_ADMIN))
+    return ReplyKeyboardMarkup([row], resize_keyboard=True, is_persistent=True)
+
+
 def user_home_keyboard(admin: bool, channels: list[dict[str, Any]] | None = None) -> InlineKeyboardMarkup:
     rows = subscribe_rows(channels or [])
     rows.append([InlineKeyboardButton("🎵 Как скачать?", callback_data="help")])
@@ -624,18 +653,23 @@ def welcome_text(admin: bool) -> str:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if not user or not update.message:
+    target = update.effective_message
+    if not user or not target:
         return
     pending_action.pop(user.id, None)
+    admin = is_admin(user)
     channels = load_settings().get("channels") or []
-    text = welcome_text(is_admin(user))
-    if channels:
-        text += "\n\n📢 Сначала подпишись на канал кнопкой ниже, потом кидай ссылку на YouTube."
-    await update.message.reply_html(
-        text,
-        reply_markup=user_home_keyboard(is_admin(user), channels),
+    await target.reply_html(
+        welcome_text(admin),
+        reply_markup=bottom_keyboard(admin),
         disable_web_page_preview=True,
     )
+    if channels:
+        await target.reply_html(
+            "📢 Сначала подпишись на канал кнопкой ниже, потом кидай ссылку на YouTube.",
+            reply_markup=subscribe_keyboard(channels),
+            disable_web_page_preview=True,
+        )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1475,6 +1509,13 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     text = msg.text or msg.caption or ""
 
+    if is_start_text(text):
+        await cmd_start(update, context)
+        return
+    if is_admin_btn_text(text):
+        await cmd_admin(update, context)
+        return
+
     if await handle_admin_text(update, context, text):
         return
 
@@ -1741,11 +1782,21 @@ def main() -> None:
     if not shutil.which("ffmpeg"):
         log.warning("ffmpeg не найден в PATH — конвертация в MP3 может не сработать")
 
+    async def _post_init(application: Application) -> None:
+        await application.bot.set_my_commands(
+            [
+                BotCommand("start", "Старт"),
+                BotCommand("help", "Как скачать"),
+                BotCommand("admin", "Админка"),
+            ]
+        )
+
     start_http()
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .concurrent_updates(True)
+        .post_init(_post_init)
         .build()
     )
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
