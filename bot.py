@@ -803,11 +803,66 @@ def http_json(method: str, url: str, payload: dict | None = None, headers: dict 
     return parsed if isinstance(parsed, dict) else {}
 
 
-def http_download(url: str, dest: Path, timeout: int = 60) -> None:
+class DownloadProgress:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.phase = "start"
+        self.percent = 0
+        self.title = ""
+
+    def set(self, phase: str, percent: int, title: str | None = None) -> None:
+        with self._lock:
+            self.phase = phase
+            self.percent = max(0, min(100, int(percent)))
+            if title:
+                self.title = title[:80]
+
+    def snapshot(self) -> tuple[str, int, str]:
+        with self._lock:
+            return self.phase, self.percent, self.title
+
+
+def progress_bar(percent: int) -> str:
+    percent = max(0, min(100, int(percent)))
+    filled = round(percent / 10)
+    return "█" * filled + "░" * (10 - filled)
+
+
+def format_progress(prog: DownloadProgress) -> str:
+    phase, percent, title = prog.snapshot()
+    labels = {
+        "start": "Готовлю",
+        "convert": "Собираю MP3",
+        "download": "Скачиваю",
+        "send": "Отправляю",
+    }
+    line = f"⬇️ {labels.get(phase, 'Качаю')} {progress_bar(percent)} {percent}%"
+    if title:
+        return f"{line}\n🎵 {title}"
+    return line
+
+
+def loader_percent(raw: Any) -> int | None:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value > 100:
+        value = value / 10.0
+    return max(0, min(100, int(value)))
+
+
+def http_download(url: str, dest: Path, timeout: int = 90, progress: DownloadProgress | None = None) -> None:
     req = Request(url, headers={"User-Agent": HTTP_UA, "Accept": "*/*"})
     limit = MAX_FILE_MB * 1024 * 1024
     with urlopen(req, timeout=timeout) as resp, dest.open("wb") as out:
+        total = 0
+        try:
+            total = int(resp.headers.get("Content-Length") or 0)
+        except ValueError:
+            total = 0
         n = 0
+        last_pct = -1
         while True:
             chunk = resp.read(256 * 1024)
             if not chunk:
@@ -817,8 +872,18 @@ def http_download(url: str, dest: Path, timeout: int = 60) -> None:
                 dest.unlink(missing_ok=True)
                 raise RuntimeError(f"Файл слишком большой. Лимит Telegram — {MAX_FILE_MB} МБ.")
             out.write(chunk)
+            if progress:
+                if total > 0:
+                    pct = 70 + int(25 * n / total)
+                else:
+                    pct = min(94, 70 + n // 300_000)
+                if pct != last_pct:
+                    progress.set("download", pct)
+                    last_pct = pct
     if not dest.exists() or dest.stat().st_size < 1000:
         raise RuntimeError("Пустой файл, YouTube не отдал аудио.")
+    if progress:
+        progress.set("download", 95)
 
 
 def convert_to_mp3(src: Path, dest: Path) -> None:
@@ -863,15 +928,21 @@ def pick_best_audio(medias: list[dict[str, Any]]) -> dict[str, Any] | None:
     return max(audios, key=score)
 
 
-def download_via_loader(url: str, workdir: Path) -> dict[str, Any] | None:
+def download_via_loader(url: str, workdir: Path, progress: DownloadProgress | None = None) -> dict[str, Any] | None:
     from urllib.parse import quote
 
+    if progress:
+        progress.set("convert", 3)
     start_url = "https://loader.to/ajax/download.php?format=mp3&url=" + quote(url, safe="")
     try:
-        start = http_json("GET", start_url, timeout=12)
+        start = http_json("GET", start_url, timeout=15)
     except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
         log.warning("loader.to старт: %s", e)
         return None
+    start_info = start.get("info") if isinstance(start.get("info"), dict) else {}
+    start_title = str(start.get("title") or start_info.get("title") or "")
+    if progress and start_title:
+        progress.set("convert", 8, start_title)
     text = str(start.get("text") or start.get("message") or "")
     if not start.get("success"):
         low = text.lower()
@@ -883,11 +954,11 @@ def download_via_loader(url: str, workdir: Path) -> dict[str, Any] | None:
     if not progress_url:
         return None
     data = start
-    deadline = time.time() + 28
+    deadline = time.time() + 120
     while time.time() < deadline:
         if data.get("success") in (1, True) and data.get("download_url"):
             break
-        time.sleep(0.45)
+        time.sleep(0.4)
         try:
             data = http_json("GET", progress_url, timeout=8)
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
@@ -896,12 +967,19 @@ def download_via_loader(url: str, workdir: Path) -> dict[str, Any] | None:
         msg = str(data.get("text") or data.get("message") or "")
         if any(s in msg.lower() for s in ("unavailable", "removed", "private")):
             raise RuntimeError("UNAVAILABLE")
+        pct = loader_percent(data.get("progress"))
+        if progress and pct is not None:
+            data_info = data.get("info") if isinstance(data.get("info"), dict) else {}
+            title = str(data.get("title") or data_info.get("title") or start_title)
+            progress.set("convert", max(5, int(pct * 0.7)), title)
     download_url = data.get("download_url")
     if not download_url:
         log.warning("loader.to: нет download_url %s", data)
         return None
+    if progress:
+        progress.set("download", 72, start_title)
     mp3_path = workdir / "audio.mp3"
-    http_download(download_url, mp3_path)
+    http_download(download_url, mp3_path, progress=progress)
     info = data.get("info") if isinstance(data.get("info"), dict) else {}
     title = (data.get("title") or info.get("title") or start.get("title") or "YouTube audio").strip()
     duration = int(data.get("video_duration") or info.get("duration") or 0)
@@ -919,7 +997,7 @@ def download_via_loader(url: str, workdir: Path) -> dict[str, Any] | None:
     }
 
 
-def download_via_clipto(url: str, workdir: Path) -> dict[str, Any] | None:
+def download_via_clipto(url: str, workdir: Path, progress: DownloadProgress | None = None) -> dict[str, Any] | None:
     try:
         data = http_json(
             "POST",
@@ -943,7 +1021,9 @@ def download_via_clipto(url: str, workdir: Path) -> dict[str, Any] | None:
         return None
     ext = str(media.get("ext") or "m4a").lstrip(".")
     raw_path = workdir / f"src.{ext}"
-    http_download(media["url"], raw_path)
+    if progress:
+        progress.set("download", 40, str(data.get("title") or ""))
+    http_download(media["url"], raw_path, progress=progress)
     mp3_path = workdir / "audio.mp3"
     convert_to_mp3(raw_path, mp3_path)
     duration = int(data.get("duration") or 0)
@@ -976,7 +1056,7 @@ def cookies_file() -> str | None:
     return None
 
 
-def download_via_ytdlp(url: str, workdir: Path) -> dict[str, Any] | None:
+def download_via_ytdlp(url: str, workdir: Path, progress: DownloadProgress | None = None) -> dict[str, Any] | None:
     import yt_dlp
     from yt_dlp.utils import DownloadError, YoutubeDLError
 
@@ -1009,6 +1089,16 @@ def download_via_ytdlp(url: str, workdir: Path) -> dict[str, Any] | None:
     }
     if cookie:
         opts["cookiefile"] = cookie
+    if progress:
+        def _hook(event: dict[str, Any]) -> None:
+            if event.get("status") != "downloading":
+                return
+            total = event.get("total_bytes") or event.get("total_bytes_estimate") or 0
+            got = event.get("downloaded_bytes") or 0
+            if total:
+                progress.set("download", int(100 * got / total))
+
+        opts["progress_hooks"] = [_hook]
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True) or {}
@@ -1031,55 +1121,35 @@ def download_via_ytdlp(url: str, workdir: Path) -> dict[str, Any] | None:
     }
 
 
-def download_mp3(url: str, workdir: Path) -> dict[str, Any]:
+def download_mp3(url: str, workdir: Path, progress: DownloadProgress | None = None) -> dict[str, Any]:
     last_err = ""
-    backends = [("loader.to", download_via_loader)]
+    dest = workdir / "loader_to"
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        got = download_via_loader(url, dest, progress)
+        if got:
+            log.info("Скачал через loader.to: %s", got.get("title"))
+            return got
+    except RuntimeError as e:
+        if str(e) == "UNAVAILABLE":
+            raise RuntimeError("Это видео недоступно (удалено, приватное или заблокировано).") from e
+        last_err = str(e)
+        log.warning("loader.to: %s", e)
+    except Exception as e:
+        last_err = str(e)
+        log.warning("loader.to unexpected: %s", e)
+
     if cookies_file():
-        backends.append(("yt-dlp", download_via_ytdlp))
-
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    if len(backends) == 1:
-        name, fn = backends[0]
-        dest = workdir / name.replace(".", "_")
-        dest.mkdir(parents=True, exist_ok=True)
+        ydest = workdir / "ytdlp"
+        ydest.mkdir(parents=True, exist_ok=True)
         try:
-            got = fn(url, dest)
+            got = download_via_ytdlp(url, ydest, progress)
             if got:
-                log.info("Скачал через %s: %s", name, got.get("title"))
+                log.info("Скачал через yt-dlp: %s", got.get("title"))
                 return got
         except RuntimeError as e:
-            if str(e) == "UNAVAILABLE":
-                raise RuntimeError("Это видео недоступно (удалено, приватное или заблокировано).") from e
             last_err = str(e)
-        raise RuntimeError(humanize_ytdlp_error(last_err) if last_err else "Не получилось скачать. Попробуй другую ссылку.")
-
-    last_err = ""
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futs = {}
-        for name, fn in backends:
-            dest = workdir / name.replace(".", "_")
-            dest.mkdir(parents=True, exist_ok=True)
-            futs[pool.submit(fn, url, dest)] = name
-        try:
-            completed = as_completed(futs, timeout=55)
-        except TimeoutError:
-            completed = []
-        for fut in completed:
-            name = futs[fut]
-            try:
-                got = fut.result()
-                if got:
-                    log.info("Скачал через %s: %s", name, got.get("title"))
-                    return got
-            except RuntimeError as e:
-                if str(e) == "UNAVAILABLE":
-                    raise RuntimeError("Это видео недоступно (удалено, приватное или заблокировано).") from e
-                last_err = str(e)
-                log.warning("%s: %s", name, e)
-            except Exception as e:
-                last_err = str(e)
-                log.warning("%s unexpected: %s", name, e)
+            log.warning("yt-dlp: %s", e)
     raise RuntimeError(humanize_ytdlp_error(last_err) if last_err else "Не получилось скачать. Попробуй другую ссылку.")
 
 
@@ -1136,15 +1206,30 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     async with lock:
-        status = await msg.reply_text("⬇️ Качаю…")
+        progress = DownloadProgress()
+        progress.set("start", 2)
+        status = await msg.reply_text(format_progress(progress))
         workdir = Path(tempfile.mkdtemp(prefix="ytmp3_", dir=str(DATA_DIR)))
         try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(download_mp3, url, workdir),
-                timeout=70,
-            )
+            dl_task = asyncio.create_task(asyncio.to_thread(download_mp3, url, workdir, progress))
+            last_text = ""
+            deadline = time.time() + 180
+            while not dl_task.done():
+                if time.time() > deadline:
+                    dl_task.cancel()
+                    raise asyncio.TimeoutError
+                text = format_progress(progress)
+                if text != last_text:
+                    try:
+                        await status.edit_text(text)
+                    except BadRequest:
+                        pass
+                    last_text = text
+                await asyncio.sleep(1)
+            result = dl_task.result()
+            progress.set("send", 97, result.get("title") or "")
             try:
-                await status.edit_text("📤 Отправляю…")
+                await status.edit_text(format_progress(progress))
             except BadRequest:
                 pass
 
