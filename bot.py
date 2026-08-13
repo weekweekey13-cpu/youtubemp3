@@ -99,6 +99,7 @@ DEFAULT_CHANNELS = [
         "username": "emilyfox777",
         "chat_id": -1003167848024,
         "url": "https://t.me/emilyfox777",
+        "button_text": "Подписаться на Emily Fox",
     }
 ]
 
@@ -293,6 +294,19 @@ def channel_button_title(ch: dict[str, Any], index: int) -> str:
     return f"Канал {index}"
 
 
+def subscribe_button_label(ch: dict[str, Any], index: int) -> str:
+    custom = (ch.get("button_text") or "").strip()
+    if custom:
+        return custom[:64]
+    return f"Подписаться на {channel_button_title(ch, index)}"[:64]
+
+
+def check_button_label(settings: dict[str, Any] | None = None) -> str:
+    data = settings if settings is not None else load_settings()
+    custom = (data.get("check_button") or "").strip()
+    return (custom or "✅ Я подписался")[:64]
+
+
 def fmt_duration(sec: int | float | None) -> str:
     if not sec:
         return "—"
@@ -328,16 +342,16 @@ def channel_public_url(ch: dict[str, Any]) -> str:
 def subscribe_rows(channels: list[dict[str, Any]]) -> list[list[InlineKeyboardButton]]:
     rows: list[list[InlineKeyboardButton]] = []
     for i, ch in enumerate(channels, start=1):
-        title = channel_button_title(ch, i)
+        label = subscribe_button_label(ch, i)
         url = channel_public_url(ch)
         if url:
-            rows.append([InlineKeyboardButton(f"📢 Подписаться · {title}", url=url)])
+            rows.append([InlineKeyboardButton(label, url=url)])
         else:
             rows.append(
-                [InlineKeyboardButton(f"📢 {title}", callback_data=f"subneed:{ch.get('id')}")]
+                [InlineKeyboardButton(label, callback_data=f"subneed:{ch.get('id')}")]
             )
     if channels:
-        rows.append([InlineKeyboardButton("✅ Я подписался", callback_data="check_sub")])
+        rows.append([InlineKeyboardButton(check_button_label(), callback_data="check_sub")])
     return rows
 
 
@@ -360,9 +374,11 @@ def admin_keyboard(channels: list[dict[str, Any]]) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(f"📢 {title}", callback_data=f"chinfo:{ch.get('id')}"),
+                InlineKeyboardButton("✏️", callback_data=f"chbtn:{ch.get('id')}"),
                 InlineKeyboardButton("🗑", callback_data=f"chdel:{ch.get('id')}"),
             ]
         )
+    rows.append([InlineKeyboardButton("✏️ Текст «Я подписался»", callback_data="checkbtn")])
     rows.append([InlineKeyboardButton("👁 Как видят кнопку подписки", callback_data="subpreview")])
     rows.append([InlineKeyboardButton("➕ Добавить канал", callback_data="chadd")])
     rows.append([InlineKeyboardButton("♻️ Рестарт бота", callback_data="restart_ask")])
@@ -581,6 +597,8 @@ def admin_text() -> str:
         "Чтобы добавить: нажми «Добавить канал» и пришли ссылку вида",
         "<code>https://t.me/channel</code> или <code>@channel</code>.",
         "",
+        "✏️ — поменять текст кнопки, например <code>Подписаться на наш канал</code>.",
+        "",
         "Пароль Google боту не нужен. По желанию пришли файл <code>cookies.txt</code> — для сложных роликов.",
     ]
     if channels:
@@ -729,6 +747,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 status = f"ошибка проверки: {e}"
         text = (
             f"📢 <b>{channel_button_title(ch, 1)}</b>\n\n"
+            f"кнопка: <code>{subscribe_button_label(ch, 1)}</code>\n"
             f"id: <code>{ch.get('id')}</code>\n"
             f"chat_id: <code>{chat_id or '—'}</code>\n"
             f"ссылка: {ch.get('url') or '—'}\n"
@@ -741,9 +760,45 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             disable_web_page_preview=True,
             reply_markup=InlineKeyboardMarkup(
                 [
+                    [InlineKeyboardButton("✏️ Текст кнопки", callback_data=f"chbtn:{ch_id}")],
                     [InlineKeyboardButton("🗑 Убрать из обязательных", callback_data=f"chdel:{ch_id}")],
                     [InlineKeyboardButton("⬅️ Назад", callback_data="admin")],
                 ]
+            ),
+        )
+        return
+
+    if data.startswith("chbtn:"):
+        ch_id = data.split(":", 1)[1]
+        ch = next((c for c in load_settings()["channels"] if str(c.get("id")) == ch_id), None)
+        if not ch:
+            await query.answer("Канал не найден.")
+            await show_admin(query, context)
+            return
+        pending_action[user.id] = f"rename_btn:{ch_id}"
+        await query.edit_message_text(
+            "✏️ Пришли новый текст кнопки.\n\n"
+            f"Сейчас: <code>{subscribe_button_label(ch, 1)}</code>\n\n"
+            "Например: <code>Подписаться на наш канал</code>\n"
+            "Не больше 64 символов.\n\n"
+            "Отмена: /start",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="admin")]]
+            ),
+        )
+        return
+
+    if data == "checkbtn":
+        pending_action[user.id] = "rename_check"
+        await query.edit_message_text(
+            "✏️ Пришли текст кнопки проверки подписки.\n\n"
+            f"Сейчас: <code>{check_button_label()}</code>\n\n"
+            "Например: <code>✅ Я подписался</code>\n"
+            "Отмена: /start",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="admin")]]
             ),
         )
         return
@@ -799,6 +854,51 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if not user or not is_admin(user):
         return False
     action = pending_action.get(user.id)
+    if not action:
+        return False
+
+    if action.startswith("rename_btn:"):
+        ch_id = action.split(":", 1)[1]
+        label = " ".join((text or "").split())
+        if not label or len(label) > 64:
+            await update.message.reply_text("Текст пустой или длиннее 64 символов. Пришли короче.")
+            return True
+        settings = load_settings()
+        found = False
+        for ch in settings["channels"]:
+            if str(ch.get("id")) == ch_id:
+                ch["button_text"] = label
+                found = True
+                break
+        if not found:
+            pending_action.pop(user.id, None)
+            await update.message.reply_text("Канал не найден.")
+            return True
+        save_settings(settings)
+        pending_action.pop(user.id, None)
+        await update.message.reply_html(
+            f"✅ Кнопка теперь: <code>{label}</code>\nТак её видят пользователи:",
+            reply_markup=subscribe_keyboard(settings["channels"]),
+        )
+        await update.message.reply_html(admin_text(), reply_markup=admin_keyboard(settings["channels"]))
+        return True
+
+    if action == "rename_check":
+        label = " ".join((text or "").split())
+        if not label or len(label) > 64:
+            await update.message.reply_text("Текст пустой или длиннее 64 символов. Пришли короче.")
+            return True
+        settings = load_settings()
+        settings["check_button"] = label
+        save_settings(settings)
+        pending_action.pop(user.id, None)
+        await update.message.reply_html(
+            f"✅ Кнопка проверки теперь: <code>{label}</code>",
+            reply_markup=subscribe_keyboard(settings["channels"]),
+        )
+        await update.message.reply_html(admin_text(), reply_markup=admin_keyboard(settings["channels"]))
+        return True
+
     if action != "add_channel":
         return False
 
@@ -853,6 +953,8 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             "после того, как добавишь бота админом — или перешли любое сообщение из канала."
         )
 
+    if not parsed.get("button_text"):
+        parsed["button_text"] = f"Подписаться на {channel_button_title(parsed, 1)}"[:64]
     settings["channels"].append(parsed)
     save_settings(settings)
     pending_action.pop(user.id, None)
