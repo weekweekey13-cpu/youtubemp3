@@ -29,11 +29,12 @@ from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageOriginChannel, Update
-from telegram.constants import ChatMemberStatus, ParseMode
+from telegram.constants import ChatMemberStatus, ChatType, ParseMode
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -75,6 +76,10 @@ ANY_YT_RE = re.compile(
 BARE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 TG_LINK_RE = re.compile(
     r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_+]+)",
+    re.IGNORECASE,
+)
+TG_C_RE = re.compile(
+    r"(?:https?://)?(?:t\.me|telegram\.me)/c/(\d+)",
     re.IGNORECASE,
 )
 
@@ -236,10 +241,28 @@ def extract_youtube_url(text: str) -> str | None:
     return None
 
 
+def has_numeric_chat(ch: dict[str, Any]) -> bool:
+    raw = ch.get("chat_id")
+    if raw in (None, ""):
+        return False
+    return str(raw).lstrip("-").isdigit()
+
+
 def parse_channel_input(text: str) -> dict[str, Any] | None:
     text = (text or "").strip()
     if not text:
         return None
+
+    c_m = TG_C_RE.search(text)
+    if c_m:
+        chat_id = int("-100" + c_m.group(1))
+        return {
+            "id": str(chat_id),
+            "title": f"Чат {chat_id}",
+            "username": "",
+            "chat_id": chat_id,
+            "url": text if text.lower().startswith("http") else f"https://t.me/c/{c_m.group(1)}/1",
+        }
 
     if text.startswith("@"):
         username = text[1:].strip()
@@ -386,15 +409,70 @@ def admin_keyboard(channels: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def bind_known_chat(chat, invite_url: str = "") -> dict[str, Any]:
+    """Пишет числовой id приватного канала в настройки."""
+    settings = load_settings()
+    chat_id = int(chat.id)
+    username = getattr(chat, "username", None) or ""
+    title = chat.title or str(chat_id)
+    url = f"https://t.me/{username}" if username else (invite_url or "")
+
+    for ch in settings["channels"]:
+        same = str(ch.get("chat_id")) in {str(chat_id), f"@{username}"} if username else str(ch.get("chat_id")) == str(chat_id)
+        same = same or (username and str(ch.get("id") or "").lower() == username.lower())
+        same = same or (title and (ch.get("title") or "") == title)
+        if same:
+            ch["chat_id"] = chat_id
+            ch["title"] = title
+            if username:
+                ch["username"] = username
+                ch["id"] = username.lower()
+                ch["url"] = url or ch.get("url") or ""
+            else:
+                ch["id"] = str(chat_id)
+                if url and not channel_public_url(ch):
+                    ch["url"] = url
+            save_settings(settings)
+            return ch
+
+    incomplete = [c for c in settings["channels"] if not has_numeric_chat(c)]
+    if len(incomplete) == 1:
+        ch = incomplete[0]
+        keep_url = ch.get("url") or url
+        ch["chat_id"] = chat_id
+        ch["title"] = title or ch.get("title")
+        ch["id"] = username.lower() if username else str(chat_id)
+        if username:
+            ch["username"] = username
+        if keep_url:
+            ch["url"] = keep_url
+        save_settings(settings)
+        return ch
+
+    new_ch = {
+        "id": username.lower() if username else str(chat_id),
+        "title": title,
+        "username": username,
+        "chat_id": chat_id,
+        "url": url,
+        "button_text": f"Подписаться на {title}"[:64],
+    }
+    settings["channels"].append(new_ch)
+    save_settings(settings)
+    return new_ch
+
+
 def channel_candidates(ch: dict[str, Any]) -> list[Any]:
     out: list[Any] = []
     raw = ch.get("chat_id")
     if raw not in (None, ""):
-        out.append(raw)
-        if isinstance(raw, str) and raw.lstrip("-").isdigit():
-            out.append(int(raw))
+        s = str(raw)
+        if s.lstrip("-").isdigit():
+            out.append(int(s))
+        elif s.startswith("@") and not s.startswith("@+"):
+            out.append(s)
     username = (ch.get("username") or "").strip().lstrip("@")
-    if username:
+    if username and not username.startswith("+"):
         out.append("@" + username)
     seen: set[str] = set()
     uniq: list[Any] = []
@@ -474,7 +552,7 @@ def subscribe_block_text(
             "Ты можешь быть подписан, но Telegram не отдаёт список участников, "
             "пока бот не станет <b>админом</b> этого канала.\n\n"
             "Админ канала: добавь <code>@dowloadmp3youtube_mp3bot</code> администратором "
-            "(права можно оставить минимальные), затем нажми «Я подписался»."
+            "и <b>перешли боту любой пост</b> из приватного канала — иначе нет числового id."
         )
     extra = ""
     if broken:
@@ -709,8 +787,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "➕ Пришли ссылку на канал:\n\n"
             "<code>https://t.me/имя</code>\n"
             "<code>@имя</code>\n\n"
-            "Для приватного канала сначала добавь бота админом, "
-            "затем пришли ссылку-приглашение или id чата (например <code>-100123…</code>).\n\n"
+            "Для приватного канала: сделай бота админом и "
+            "<b>перешли сюда любой пост</b> из канала.\n"
+            "Можно также прислать инвайт <code>https://t.me/+…</code> "
+            "и сразу переслать пост.\n\n"
             "Отмена: /start",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(
@@ -823,6 +903,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def resolve_channel(bot, parsed: dict[str, Any]) -> dict[str, Any]:
+    chat_id = parsed.get("chat_id")
+    if not chat_id and parsed.get("url"):
+        try:
+            chat = await bot.get_chat(parsed["url"])
+            parsed["chat_id"] = chat.id
+            parsed["title"] = chat.title or parsed.get("title")
+            if chat.username:
+                parsed["username"] = chat.username
+                parsed["url"] = f"https://t.me/{chat.username}"
+                parsed["id"] = chat.username.lower()
+            else:
+                parsed["id"] = str(chat.id)
+            return parsed
+        except TelegramError as e:
+            parsed["resolve_error"] = str(e)
     chat_id = parsed.get("chat_id")
     if not chat_id:
         return parsed
@@ -947,10 +1042,11 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 "\n\n⚠️ Не смог заглянуть в канал. Добавь бота админом "
                 "(@dowloadmp3youtube_mp3bot), иначе подписку не проверить."
             )
-    elif parsed.get("url", "").find("+") != -1:
-        warn = (
-            "\n\n⚠️ Приватный инвайт. Напиши ещё id канала (число вроде <code>-100…</code>) "
-            "после того, как добавишь бота админом — или перешли любое сообщение из канала."
+    if not has_numeric_chat(parsed) and ("+" in str(parsed.get("url") or "") or str(parsed.get("id") or "").startswith("+")):
+        warn += (
+            "\n\n⚠️ Это приватный канал. Чтобы проверка заработала, "
+            "<b>перешли боту любой пост из этого канала</b> "
+            "(не ссылку, а именно пересланное сообщение)."
         )
 
     if not parsed.get("button_text"):
@@ -1536,34 +1632,57 @@ async def handle_cookies_file(update: Update, context: ContextTypes.DEFAULT_TYPE
     await msg.reply_text("Сохранил cookies. Сложные ролики теперь можно пробовать ещё раз.")
 
 
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    event = update.my_chat_member
+    if not event:
+        return
+    chat = event.chat
+    new = event.new_chat_member
+    if new.user.id != context.bot.id:
+        return
+    if new.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+        return
+    if chat.type not in (ChatType.CHANNEL, ChatType.SUPERGROUP):
+        return
+    bound = bind_known_chat(chat)
+    log.info("Бот стал админом %s (%s) — привязал к обязательным каналам", chat.title, chat.id)
+    invite = bound.get("url") or ""
+    if not invite:
+        try:
+            invite = await context.bot.export_chat_invite_link(chat.id)
+            bound["url"] = invite
+            settings = load_settings()
+            for ch in settings["channels"]:
+                if str(ch.get("chat_id")) == str(chat.id):
+                    ch["url"] = invite
+            save_settings(settings)
+        except TelegramError as e:
+            log.warning("Не смог сделать инвайт для %s: %s", chat.id, e)
+
+
 async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     user = update.effective_user
     if not msg or not user:
         return
 
-    if is_admin(user) and pending_action.get(user.id) == "add_channel":
+    if is_admin(user):
         origin = getattr(msg, "forward_origin", None)
         chat = None
         if isinstance(origin, MessageOriginChannel):
             chat = origin.chat
         elif getattr(msg, "forward_from_chat", None):
             chat = msg.forward_from_chat
-        if chat:
-            username = getattr(chat, "username", None) or ""
-            parsed = {
-                "id": (username.lower() if username else str(chat.id)),
-                "title": chat.title or (f"@{username}" if username else str(chat.id)),
-                "username": username,
-                "chat_id": f"@{username}" if username else chat.id,
-                "url": f"https://t.me/{username}" if username else "",
-            }
-            fake_text = parsed["url"] or str(parsed["chat_id"])
-            pending_action[user.id] = "add_channel"
-            await handle_admin_text(
-                update,
-                context,
-                fake_text if username else str(chat.id),
+        if chat and getattr(chat, "type", "") in {"channel", "supergroup", ""}:
+            bound = bind_known_chat(chat, invite_url=channel_public_url({"url": "", "username": getattr(chat, "username", "")}))
+            pending_action.pop(user.id, None)
+            await msg.reply_html(
+                f"✅ Привязал канал <b>{bound.get('title') or chat.id}</b>.\n"
+                f"id: <code>{bound.get('chat_id')}</code>\n"
+                "Теперь проверку подписки можно делать.\n\n"
+                "Так выглядит кнопка у пользователей:",
+                reply_markup=subscribe_keyboard(load_settings()["channels"]),
+                disable_web_page_preview=True,
             )
             return
 
@@ -1629,6 +1748,7 @@ def main() -> None:
         .concurrent_updates(True)
         .build()
     )
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("admin", cmd_admin))
