@@ -85,8 +85,19 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+DEFAULT_CHANNELS = [
+    {
+        "id": "emilyfox777",
+        "title": "Emily Fox",
+        "username": "emilyfox777",
+        "chat_id": -1003167848024,
+        "url": "https://t.me/emilyfox777",
+    }
+]
+
+
 def default_settings() -> dict[str, Any]:
-    return {"channels": []}
+    return {"channels": [dict(ch) for ch in DEFAULT_CHANNELS]}
 
 
 def load_json(path: Path, fallback: Any) -> Any:
@@ -107,10 +118,13 @@ def save_json(path: Path, data: Any) -> None:
 
 def load_settings() -> dict[str, Any]:
     with settings_lock:
+        existed = SETTINGS_PATH.exists()
         data = load_json(SETTINGS_PATH, default_settings())
         if not isinstance(data, dict):
             data = default_settings()
         data.setdefault("channels", [])
+        if not existed:
+            save_json(SETTINGS_PATH, data)
         return data
 
 
@@ -280,53 +294,118 @@ def admin_keyboard(channels: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def channel_candidates(ch: dict[str, Any]) -> list[Any]:
+    out: list[Any] = []
+    raw = ch.get("chat_id")
+    if raw not in (None, ""):
+        out.append(raw)
+        if isinstance(raw, str) and raw.lstrip("-").isdigit():
+            out.append(int(raw))
+    username = (ch.get("username") or "").strip().lstrip("@")
+    if username:
+        out.append("@" + username)
+    seen: set[str] = set()
+    uniq: list[Any] = []
+    for item in out:
+        key = str(item).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(item)
+    return uniq
+
+
+def is_bot_rights_error(err: BaseException) -> bool:
+    text = str(err).lower()
+    return any(
+        s in text
+        for s in (
+            "member list is inaccessible",
+            "chat not found",
+            "bot is not a member",
+            "not enough rights",
+            "need administrator",
+            "chat_admin_required",
+        )
+    )
+
+
+async def check_one_channel(bot, user_id: int, ch: dict[str, Any]) -> tuple[str, str]:
+    """Возвращает ('ok'|'left'|'norights'|'bad', подробность)."""
+    candidates = channel_candidates(ch)
+    if not candidates:
+        return "norights", "нет chat_id у канала"
+    last = ""
+    for cid in candidates:
+        try:
+            member = await bot.get_chat_member(cid, user_id)
+            if member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+                return "left", str(member.status)
+            if member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", True) is False:
+                return "left", "restricted"
+            return "ok", str(member.status)
+        except (Forbidden, BadRequest, TelegramError) as e:
+            last = str(e)
+            log.warning("Проверка %s / %s: %s", ch.get("username") or ch.get("id"), cid, e)
+            if is_bot_rights_error(e):
+                return "norights", last
+    return "bad", last or "неизвестная ошибка"
+
+
 async def required_missing(
     bot, user_id: int, channels: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(не подписан, каналы которые бот не может проверить)."""
     missing: list[dict[str, Any]] = []
+    broken: list[dict[str, Any]] = []
     for ch in channels:
-        chat_id = ch.get("chat_id") or (
-            "@" + ch["username"].lstrip("@") if ch.get("username") else None
-        )
-        if not chat_id:
-            missing.append(ch)
+        status, _detail = await check_one_channel(bot, user_id, ch)
+        if status == "ok":
             continue
-        try:
-            member = await bot.get_chat_member(chat_id, user_id)
-            if member.status in (
-                ChatMemberStatus.LEFT,
-                ChatMemberStatus.BANNED,
-            ):
-                missing.append(ch)
-        except Forbidden:
-            log.warning("Бот не админ в %s — не могу проверить подписку", chat_id)
+        if status == "left":
             missing.append(ch)
-        except BadRequest as e:
-            log.warning("Проверка %s: %s", chat_id, e)
-            missing.append(ch)
-        except TelegramError as e:
-            log.warning("Проверка %s: %s", chat_id, e)
-            missing.append(ch)
-    return missing
+        else:
+            broken.append(ch)
+    return missing, broken
 
 
-async def ensure_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user = update.effective_user
-    if not user:
-        return False
-    if is_admin(user):
-        return True
-    channels = load_settings().get("channels") or []
-    if not channels:
-        return True
-    missing = await required_missing(context.bot, user.id, channels)
-    if not missing:
-        return True
-    text = (
+def subscribe_block_text(
+    channels: list[dict[str, Any]],
+    missing: list[dict[str, Any]],
+    broken: list[dict[str, Any]],
+) -> str:
+    if broken and not missing:
+        names = ", ".join(channel_button_title(ch, i) for i, ch in enumerate(broken, start=1))
+        return (
+            "⚠️ <b>Не могу проверить подписку</b>\n\n"
+            f"Канал: {names}\n\n"
+            "Ты можешь быть подписан, но Telegram не отдаёт список участников, "
+            "пока бот не станет <b>админом</b> этого канала.\n\n"
+            "Админ канала: добавь <code>@dowloadmp3youtube_mp3bot</code> администратором "
+            "(права можно оставить минимальные), затем нажми «Я подписался»."
+        )
+    extra = ""
+    if broken:
+        names = ", ".join(channel_button_title(ch, i) for i, ch in enumerate(broken, start=1))
+        extra = (
+            f"\n\n⚠️ Ещё не проверяется: {names}. "
+            "Туда тоже нужно добавить бота админом."
+        )
+    return (
         "🔒 <b>Сначала подпишись на каналы</b>\n\n"
         "Без подписки скачивание недоступно.\n"
         "Нажми «Подписаться», вступи, затем «Я подписался»."
+        + extra
     )
+
+
+async def reply_subscribe_gate(
+    update: Update,
+    channels: list[dict[str, Any]],
+    missing: list[dict[str, Any]],
+    broken: list[dict[str, Any]],
+) -> None:
+    text = subscribe_block_text(channels, missing, broken)
     markup = subscribe_keyboard(channels)
     if update.callback_query:
         try:
@@ -341,6 +420,21 @@ async def ensure_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.effective_message.reply_html(
             text, reply_markup=markup, disable_web_page_preview=True
         )
+
+
+async def ensure_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    if is_admin(user):
+        return True
+    channels = load_settings().get("channels") or []
+    if not channels:
+        return True
+    missing, broken = await required_missing(context.bot, user.id, channels)
+    if not missing and not broken:
+        return True
+    await reply_subscribe_gate(update, channels, missing, broken)
     return False
 
 
@@ -370,13 +464,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     channels = load_settings().get("channels") or []
     if channels and not is_admin(user):
-        missing = await required_missing(context.bot, user.id, channels)
-        if missing:
-            await update.message.reply_html(
-                "🔒 Чтобы скачивать — подпишись на каналы ниже, потом пришли ссылку.",
-                reply_markup=subscribe_keyboard(channels),
-                disable_web_page_preview=True,
-            )
+        missing, broken = await required_missing(context.bot, user.id, channels)
+        if missing or broken:
+            await reply_subscribe_gate(update, channels, missing, broken)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -468,16 +558,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 reply_markup=user_home_keyboard(is_admin(user)),
             )
             return
-        missing = await required_missing(context.bot, user.id, channels)
-        if missing:
+        missing, broken = await required_missing(context.bot, user.id, channels)
+        if broken and not missing:
+            await query.answer(
+                "Бот не админ канала — не видит подписку. Добавь @dowloadmp3youtube_mp3bot админом.",
+                show_alert=True,
+            )
+            await reply_subscribe_gate(update, channels, missing, broken)
+            return
+        if missing or broken:
             await query.answer("Ещё не на всех каналах. Подпишись и нажми снова.", show_alert=True)
-            try:
-                await query.edit_message_text(
-                    "🔒 Подписка ещё не полная. Открой каналы кнопками ниже, вступи, затем снова «Я подписался».",
-                    reply_markup=subscribe_keyboard(channels),
-                )
-            except BadRequest:
-                pass
+            await reply_subscribe_gate(update, channels, missing, broken)
             return
         await query.edit_message_text(
             "✅ Подписка есть. Кидай ссылку на YouTube — пришлю MP3.",
