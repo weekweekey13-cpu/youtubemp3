@@ -55,6 +55,8 @@ DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT / "data")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_PATH = DATA_DIR / "settings.json"
 STATS_PATH = DATA_DIR / "stats.json"
+CACHE_PATH = DATA_DIR / "file_cache.json"
+CACHE_LIMIT = 3000
 
 MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "1200"))  # 20 мин
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "45"))
@@ -153,6 +155,51 @@ def bump_stats(user_id: int) -> None:
         users.add(int(user_id))
         stats["users"] = sorted(users)
         save_json(STATS_PATH, stats)
+
+
+def load_cache() -> dict[str, Any]:
+    data = load_json(CACHE_PATH, {})
+    return data if isinstance(data, dict) else {}
+
+
+def get_cached_track(video_id: str | None) -> dict[str, Any] | None:
+    if not video_id:
+        return None
+    with settings_lock:
+        item = load_cache().get(video_id)
+    if not isinstance(item, dict) or not item.get("file_id"):
+        return None
+    return item
+
+
+def save_cached_track(video_id: str, meta: dict[str, Any]) -> None:
+    if not video_id or not meta.get("file_id"):
+        return
+    with settings_lock:
+        cache = load_cache()
+        cache[video_id] = {
+            "file_id": meta["file_id"],
+            "title": meta.get("title") or "YouTube audio",
+            "artist": meta.get("artist") or "YouTube",
+            "duration": int(meta.get("duration") or 0),
+            "filename": meta.get("filename") or "",
+            "ts": time.time(),
+        }
+        if len(cache) > CACHE_LIMIT:
+            oldest = sorted(cache.items(), key=lambda kv: float((kv[1] or {}).get("ts") or 0))
+            for key, _ in oldest[: len(cache) - CACHE_LIMIT]:
+                cache.pop(key, None)
+        save_json(CACHE_PATH, cache)
+
+
+def drop_cached_track(video_id: str) -> None:
+    if not video_id:
+        return
+    with settings_lock:
+        cache = load_cache()
+        if video_id in cache:
+            cache.pop(video_id, None)
+            save_json(CACHE_PATH, cache)
 
 
 def is_admin(user) -> bool:
@@ -1200,6 +1247,29 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not await ensure_subscribed(update, context):
         return
 
+    video_id = youtube_id(url)
+    cached = get_cached_track(video_id)
+    if cached:
+        try:
+            cache_kwargs: dict[str, Any] = {
+                "audio": cached["file_id"],
+                "filename": cached.get("filename") or f"{safe_filename(cached.get('title') or 'audio')}.mp3",
+                "title": (cached.get("title") or "YouTube audio")[:64],
+                "performer": (cached.get("artist") or "YouTube")[:64],
+                "caption": (
+                    f"🎵 {cached.get('title') or 'YouTube audio'}\n"
+                    f"⏱ {fmt_duration(cached.get('duration'))}"
+                ),
+            }
+            if cached.get("duration"):
+                cache_kwargs["duration"] = int(cached["duration"])
+            await msg.reply_audio(**cache_kwargs)
+            bump_stats(user.id)
+            return
+        except TelegramError:
+            log.warning("Кэш file_id не сработал для %s — качаю заново", video_id)
+            drop_cached_track(video_id)
+
     lock = get_lock(user.id)
     if lock.locked():
         await msg.reply_text("Уже качаю твой предыдущий трек. Подожди немного.")
@@ -1251,12 +1321,23 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 if result["thumb"] and result["thumb"].exists():
                     thumb_file = open(result["thumb"], "rb")
                     kwargs["thumbnail"] = thumb_file
-                await msg.reply_audio(**kwargs)
+                sent = await msg.reply_audio(**kwargs)
             finally:
                 audio_file.close()
                 if thumb_file:
                     thumb_file.close()
 
+            if video_id and getattr(sent, "audio", None) and sent.audio.file_id:
+                save_cached_track(
+                    video_id,
+                    {
+                        "file_id": sent.audio.file_id,
+                        "title": result["title"],
+                        "artist": result["artist"],
+                        "duration": sent.audio.duration or result["duration"],
+                        "filename": f"{safe_filename(result['title'])}.{ext}",
+                    },
+                )
             bump_stats(user.id)
             try:
                 await status.delete()
