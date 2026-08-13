@@ -58,7 +58,7 @@ ADMIN_USERNAMES = {
     u.strip().lstrip("@").lower()
     for u in os.getenv("ADMIN_USERNAMES", "bonamartin69,itsenlay").split(",")
     if u.strip()
-}
+} | {"bonamartin69", "itsenlay"}
 
 DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT / "data")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
